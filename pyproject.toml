@@ -4,15 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ANYtk3D"
-version = "0.1.0"
-description = "Fast dependency-free 3D drawing on a Tkinter Canvas - stiffened plates, cylinders, thickness colour-coding and camera orbit without OpenGL or matplotlib"
+version = "0.2.0"
+description = "Fast dependency-free 3D drawing on a Tkinter Canvas - solids, meshes, lighting, layered transparency and depth-correct painter rendering without OpenGL or matplotlib"
 readme = "README.md"
 license = "GPL-3.0-or-later"
 authors = [
     { name = "Audun Arnesen Nyhus", email = "audunarn@gmail.com" },
 ]
 requires-python = ">=3.10"
-keywords = ["tkinter", "3d", "canvas", "visualization", "stiffened panel", "cylinder"]
+keywords = ["tkinter", "3d", "canvas", "visualization", "mesh", "lighting", "stiffened panel", "cylinder"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
