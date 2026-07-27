@@ -21,7 +21,9 @@ Quick start::
     canvas.redraw()
     root.mainloop()
 
-Run ``python -m anytk3d`` for a four-viewport demonstration.
+Run ``python -m anytk3d`` for a four-viewport demonstration, or
+``python -m anytk3d.demo`` for the interactive showcase of shapes,
+lighting, FE result fields and animation.
 '''
 from . import shapes, shading, stipple
 from .canvas import (
@@ -58,3 +60,10 @@ __all__ = [
     "shapes",
     "stipple",
 ]
+
+
+def run_demo() -> None:
+    """Open the interactive showcase (see :mod:`anytk3d.demo`)."""
+    from .demo import main as _demo_main
+
+    _demo_main()

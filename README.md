@@ -27,6 +27,9 @@ library.
   every frame is vectorised; canvas items are pooled and only
   reconfigured when their appearance changes; the interactive level of
   detail self-tunes from measured frame times
+- **Result fields and animation** — a batched `add_faces` call for meshes
+  coloured per element, plus frame capture and playback that adapts its
+  detail to the requested frame rate
 - Camera orbit, zoom and pan; plate colour-coding by thickness (or any
   scalar) with a fixed legend; X/Y/Z axis overlay and optional rulers;
   animation caching and playback
@@ -111,6 +114,42 @@ canvas.add_sphere(2.0, color='#7fb3d5', opacity=0.35)   # see the contents
 canvas.add_box(1.0, 1.0, 1.0, color='#c0392b')          # ...through the shell
 ```
 
+### Result fields
+
+`add_faces` is the batched path for a mesh where every element carries its
+own colour — an FE stress plot, a deformed shape, a utilisation map. It
+takes the whole element set in one call and computes all the centroids and
+normals as array operations:
+
+```python
+canvas.add_faces(polygons, colors=element_colors, outline='#64748b')
+canvas.set_thickness_legend([0, 80, 160, 240], unit='MPa', title='von Mises')
+```
+
+`polygons` is a sequence of vertex sequences (`Point3D` or `(x, y, z)`), or
+an `(faces, vertices, 3)` array. On a 4900-element field this compiles in
+4.5 ms against 48 ms for the same elements added one at a time.
+
+### Animation
+
+Capture a scene per step, then replay it:
+
+```python
+canvas.begin_animation_cache()
+for step in range(frames):
+    canvas.clear(keep_canvas=True)
+    canvas.add_faces(deformed_shape(step), colors=field_colors(step))
+    canvas.capture_animation_frame()
+canvas.play_animation(fps=30)          # fast=None/True/False
+```
+
+A scene without cylinders or stiffeners compiles to a single shared
+representation, so each captured frame costs one build rather than two.
+Playback defaults to `fast=None`, which starts at full detail and drops to
+the reduced-detail path as soon as a frame overruns its slot; pass `True`
+or `False` to pin it. `animation_frames`, `animation_frame_index` and
+`is_playing_animation` are available for a progress readout.
+
 ### Performance
 
 Interactive frames use a reduced-detail scene with a face budget that
@@ -123,10 +162,18 @@ canvas.set_mesh_lines(False)          # drop per-face outlines
 canvas.set_occlude_lines(False)       # keep 3D lines on top of geometry
 ```
 
-## Demo
+## Demos
 
-Four viewports — a shape gallery with lighting and transparency, and
-three structural scenes:
+The interactive showcase — shapes with live light controls, a colour-coded
+FE result field, animation playback with a measured frame rate, and a
+stiffened cylinder — is a single file you can run straight from an IDE
+(right-click → Run in PyCharm) or from a shell:
+
+```bash
+python -m anytk3d.demo
+```
+
+The original four-viewport demo is still there:
 
 ```bash
 python -m anytk3d

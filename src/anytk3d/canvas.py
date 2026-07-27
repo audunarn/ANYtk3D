@@ -103,6 +103,13 @@ _TAG_POLYGON = "_tk3d_face"
 _TAG_LINE = "_tk3d_line"
 _TAG_TEXT = "_tk3d_text"
 _TAG_HUD = "_tk3d_hud"
+_TAG_HUD_LEGEND = "_tk3d_hud_legend"
+_TAG_HUD_AXIS = "_tk3d_hud_axis"
+
+# Both HUD parts carry the shared tag so a single tag_raise keeps them above
+# the face pool, and a specific tag so each can be rebuilt on its own.
+_HUD_LEGEND_TAGS = (_TAG_HUD, _TAG_HUD_LEGEND)
+_HUD_AXIS_TAGS = (_TAG_HUD, _TAG_HUD_AXIS)
 
 # Screen coordinates are clamped before reaching Tk: enormous values from
 # near-plane grazing geometry slow the rasteriser down for no visible gain.
@@ -110,6 +117,49 @@ _COORD_LIMIT = 32000.0
 
 # Faces whose screen bounding box is smaller than this never show a pixel.
 _MIN_SCREEN_EXTENT = 0.55
+
+
+def _flatten_polygons(polygons: Iterable[Any]) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Pack a sequence of faces into one vertex array plus per-face counts.
+
+    Accepts ``Point3D`` objects, ``(x, y, z)`` sequences, or a single
+    ``(faces, vertices, 3)`` array when every face has the same vertex count.
+    """
+    if isinstance(polygons, np.ndarray) and polygons.ndim == 3:
+        face_total, vertex_total = polygons.shape[0], polygons.shape[1]
+        return (
+            np.ascontiguousarray(polygons.reshape(-1, 3), dtype=np.float32),
+            np.full(face_total, vertex_total, dtype=np.int64),
+        )
+
+    flat: List[float] = []
+    counts: List[int] = []
+    for polygon in polygons:
+        count = 0
+        for vertex in polygon:
+            if isinstance(vertex, Point3D):
+                flat.append(vertex.x)
+                flat.append(vertex.y)
+                flat.append(vertex.z)
+            else:
+                x, y, z = vertex
+                flat.append(float(x))
+                flat.append(float(y))
+                flat.append(float(z))
+            count += 1
+        if count < 3:
+            # Drop degenerate faces here so the compiled arrays stay uniform.
+            del flat[len(flat) - 3 * count:]
+            continue
+        counts.append(count)
+
+    if not counts:
+        return np.empty((0, 3), dtype=np.float32), np.empty(0, dtype=np.int64)
+    return (
+        np.asarray(flat, dtype=np.float32).reshape(-1, 3),
+        np.asarray(counts, dtype=np.int64),
+    )
 
 
 class _CompiledScene:
@@ -256,6 +306,7 @@ class Tkinter3DCanvas(tk.Frame):
         # World-space caches. Camera movement does not invalidate them.
         self._world_primitive_cache: Dict[str, List[Dict[str, Any]]] = {}
         self._scene_cache: Dict[str, _CompiledScene] = {}
+        self._quality_lod_flag: Optional[bool] = None
 
         # Animation Cache Fields
         self._animation_cache: List[Dict[str, Any]] = []
@@ -264,6 +315,14 @@ class Tkinter3DCanvas(tk.Frame):
         self._animation_frame_index = 0
         self._animation_after_id: Optional[str] = None
         self._animation_fps = 30
+        self._animation_fast: Optional[bool] = None
+        self._animation_frame_budget_ms = 33.0
+        self._animation_occluders: Optional[List[Dict[str, Any]]] = None
+
+        # HUD (legend and axis triad) is rebuilt only when it would differ,
+        # which keeps animation playback from re-creating ~50 canvas items on
+        # every frame.
+        self._hud_signature: Optional[Tuple[Any, ...]] = None
 
         # Canvas item pools; slot order is display order, so assigning slots in
         # painter order gives the correct stacking without any restacking calls.
@@ -274,6 +333,7 @@ class Tkinter3DCanvas(tk.Frame):
         self._text_pool: List[int] = []
         self._text_state: List[Optional[Tuple[Any, ...]]] = []
 
+        self.bind("<Destroy>", self._on_destroy, add="+")
         self.canvas.bind("<Configure>", self._on_resize, add="+")
         self.canvas.bind("<ButtonPress-1>", lambda event: self._on_mouse_down(event, "pan"), add="+")
         self.canvas.bind("<B1-Motion>", self._on_mouse_drag, add="+")
@@ -428,7 +488,10 @@ class Tkinter3DCanvas(tk.Frame):
         self._request_redraw()
 
     def set_axis_indicator(self, visible: bool = True) -> None:
-        self._show_axis_indicator = bool(visible)
+        visible = bool(visible)
+        if visible != self._show_axis_indicator:
+            self._show_axis_indicator = visible
+            self._request_redraw()
 
     def set_mesh_lines(self, visible: bool = True) -> None:
         new_val = bool(visible)
@@ -514,7 +577,7 @@ class Tkinter3DCanvas(tk.Frame):
             fill=self.bg,
             outline="#d0d0d0",
             width=1,
-            tags=_TAG_HUD,
+            tags=_HUD_LEGEND_TAGS,
         )
 
         padding = 14
@@ -532,7 +595,7 @@ class Tkinter3DCanvas(tk.Frame):
                 anchor="nw",
                 font=("TkDefaultFont", 10, "bold"),
                 fill="#202020",
-                tags=_TAG_HUD,
+                tags=_HUD_LEGEND_TAGS,
             )
             title_y += 15
 
@@ -558,7 +621,7 @@ class Tkinter3DCanvas(tk.Frame):
                     fill=color,
                     outline="#505050",
                     width=1,
-                    tags=_TAG_HUD,
+                    tags=_HUD_LEGEND_TAGS,
                 )
                 self.canvas.create_text(
                     left + padding + swatch_width + 10,
@@ -566,7 +629,7 @@ class Tkinter3DCanvas(tk.Frame):
                     text=self._format_legend_value(value),
                     anchor="w",
                     fill="#202020",
-                    tags=_TAG_HUD,
+                    tags=_HUD_LEGEND_TAGS,
                 )
                 y_coord += row_height
             return
@@ -590,7 +653,7 @@ class Tkinter3DCanvas(tk.Frame):
                 y_1,
                 fill=color,
                 outline=color,
-                tags=_TAG_HUD,
+                tags=_HUD_LEGEND_TAGS,
             )
         self.canvas.create_rectangle(
             bar_left,
@@ -600,7 +663,7 @@ class Tkinter3DCanvas(tk.Frame):
             fill="",
             outline="#505050",
             width=1,
-            tags=_TAG_HUD,
+            tags=_HUD_LEGEND_TAGS,
         )
 
         tick_count = 6
@@ -609,7 +672,7 @@ class Tkinter3DCanvas(tk.Frame):
             value = maximum - fraction * (maximum - minimum)
             y_coord = bar_top + fraction * (bar_bottom - bar_top)
             self.canvas.create_line(
-                bar_right, y_coord, bar_right + 5, y_coord, fill="#505050", tags=_TAG_HUD
+                bar_right, y_coord, bar_right + 5, y_coord, fill="#505050", tags=_HUD_LEGEND_TAGS
             )
             self.canvas.create_text(
                 bar_right + 10,
@@ -617,8 +680,52 @@ class Tkinter3DCanvas(tk.Frame):
                 text=self._format_legend_value(value),
                 anchor="w",
                 fill="#202020",
-                tags=_TAG_HUD,
+                tags=_HUD_LEGEND_TAGS,
             )
+
+    def _draw_hud(self) -> None:
+        """
+        Redraw the fixed overlay, but only the parts that would differ.
+
+        The legend depends on its own contents and the widget size; the axis
+        triad additionally follows the camera.  Tracking them separately means
+        orbiting rebuilds seven small items instead of the whole legend, and
+        animation playback - where neither changes - rebuilds nothing at all.
+        """
+        legend = self._thickness_legend
+        legend_signature: Any = None
+        if legend is not None:
+            legend_signature = (
+                legend.get("title"),
+                legend.get("unit"),
+                legend.get("minimum"),
+                legend.get("maximum"),
+                tuple(legend.get("values", ())),
+                legend.get("width"),
+                self.width,
+                self.height,
+                self.bg,
+            )
+        axis_signature: Any = None
+        if self._show_axis_indicator:
+            axis_signature = (
+                self.width,
+                self.height,
+                round(self.camera.azimuth, 4),
+                round(self.camera.elevation, 4),
+                self._plot_width(),
+            )
+
+        previous_legend, previous_axis = self._hud_signature or (None, None)
+        if legend_signature != previous_legend:
+            self.canvas.delete(_TAG_HUD_LEGEND)
+            if legend is not None:
+                self._draw_thickness_legend()
+        if axis_signature != previous_axis:
+            self.canvas.delete(_TAG_HUD_AXIS)
+            if self._show_axis_indicator:
+                self._draw_axis_indicator()
+        self._hud_signature = (legend_signature, axis_signature)
 
     def _draw_axis_indicator(self) -> None:
         if not self._show_axis_indicator:
@@ -656,7 +763,7 @@ class Tkinter3DCanvas(tk.Frame):
             origin_y + 2,
             fill="#202020",
             outline="",
-            tags=_TAG_HUD,
+            tags=_HUD_AXIS_TAGS,
         )
         for label, vector, color in axes:
             dx, dy = screen_delta(vector)
@@ -673,7 +780,7 @@ class Tkinter3DCanvas(tk.Frame):
                 width=2,
                 arrow=tk.LAST,
                 arrowshape=(9, 11, 4),
-                tags=_TAG_HUD,
+                tags=_HUD_AXIS_TAGS,
             )
             label_offset = 11.0
             length = max(math.hypot(dx, dy), 1.0)
@@ -683,12 +790,37 @@ class Tkinter3DCanvas(tk.Frame):
                 text=label,
                 fill=color,
                 font=("TkDefaultFont", 10, "bold"),
-                tags=_TAG_HUD,
+                tags=_HUD_AXIS_TAGS,
             )
 
     # ------------------------------------------------------------------
     # Event handling and redraw scheduling
     # ------------------------------------------------------------------
+
+    def _on_destroy(self, event: tk.Event) -> None:
+        """
+        Drop every pending callback when the widget goes away.
+
+        A redraw or animation step scheduled with ``after`` outlives the
+        widget otherwise, and Tk reports the dangling handler as an "invalid
+        command name" on stderr the moment it fires.
+        """
+        if event.widget is not self:
+            return
+        for attribute in (
+            "_redraw_after_id",
+            "_finish_interaction_after_id",
+            "_animation_after_id",
+        ):
+            handle = getattr(self, attribute, None)
+            if handle is None:
+                continue
+            setattr(self, attribute, None)
+            try:
+                self.after_cancel(handle)
+            except (tk.TclError, ValueError):
+                pass
+        self._is_playing_animation = False
 
     def _on_resize(self, event: tk.Event) -> None:
         new_width = max(1, int(event.width))
@@ -793,39 +925,80 @@ class Tkinter3DCanvas(tk.Frame):
     # Scene lifecycle and cache management
     # ------------------------------------------------------------------
 
+    @property
+    def animation_frames(self) -> int:
+        """Number of frames currently held in the animation cache."""
+        return len(self._animation_cache)
+
+    @property
+    def animation_frame_index(self) -> int:
+        """Index of the frame shown last; useful for a progress readout."""
+        return self._animation_frame_index
+
+    @property
+    def is_playing_animation(self) -> bool:
+        return self._is_playing_animation
+
     def begin_animation_cache(self) -> None:
         self.stop_animation()
         self._animation_cache.clear()
 
     def capture_animation_frame(self) -> None:
+        """
+        Freeze the current scene as one animation frame.
+
+        Both quality levels are stored, but a scene without cylinders or
+        stiffeners compiles to a single shared representation, so a polygon
+        or mesh result field costs one build rather than two.  The occluder
+        set is captured too: playback must not test frames against whatever
+        happens to be in ``objects`` when they are shown.
+        """
         self._is_capturing_animation = True
         try:
+            full_key = self._quality_key("full")
+            fast_key = self._quality_key("fast")
             self._animation_cache.append(
                 {
                     "scene_full": self._get_scene("full"),
                     "scene_fast": self._get_scene("fast"),
-                    "primitives_full": self._world_primitive_cache.get("full", []),
-                    "primitives_fast": self._world_primitive_cache.get("fast", []),
+                    "primitives_full": self._world_primitive_cache.get(full_key, []),
+                    "primitives_fast": self._world_primitive_cache.get(fast_key, []),
                     "legend": self._thickness_legend,
+                    "occluders": self._collect_opaque_cylinder_occluders(),
                 }
             )
         finally:
             self._is_capturing_animation = False
 
-    def play_animation(self, fps: int = 30) -> None:
+    def play_animation(self, fps: int = 30, fast: Optional[bool] = None) -> None:
+        """
+        Replay the captured frames.
+
+        ``fast`` picks the reduced-detail render path (screen-space level of
+        detail, no stipple, no per-face outlines).  The default adapts: full
+        detail is used while it keeps up with ``fps``, and playback drops to
+        the fast path once frames start running over their budget.
+        """
         if not self._animation_cache:
             return
         self.stop_animation()
         self._animation_fps = max(1, fps)
+        self._animation_fast = fast
+        self._animation_frame_budget_ms = max(1.0, 1000.0 / self._animation_fps)
         self._is_playing_animation = True
         self._animation_frame_index = 0
         self._animation_tick()
 
     def stop_animation(self) -> None:
+        was_playing = self._is_playing_animation
         self._is_playing_animation = False
+        self._animation_occluders = None
         if self._animation_after_id is not None:
             self.after_cancel(self._animation_after_id)
             self._animation_after_id = None
+        if was_playing:
+            # Leave a full-quality frame behind, whatever playback was using.
+            self._interactive_render = False
         # Restore normal view
         self._request_redraw(interactive=False)
 
@@ -838,18 +1011,32 @@ class Tkinter3DCanvas(tk.Frame):
         saved_scenes = dict(self._scene_cache)
         saved_primitives = dict(self._world_primitive_cache)
         saved_legend = self._thickness_legend
+        saved_interactive = self._interactive_render
 
+        # Frames were captured under the object list of their own moment, so
+        # the cache keys are recomputed here rather than reused from `objects`.
         self._scene_cache["full"] = frame["scene_full"]
         self._scene_cache["fast"] = frame["scene_fast"]
         self._world_primitive_cache["full"] = frame["primitives_full"]
         self._world_primitive_cache["fast"] = frame["primitives_fast"]
         self._thickness_legend = frame["legend"]
+        self._animation_occluders = frame.get("occluders") or []
+        self._interactive_render = bool(self._animation_fast)
 
+        started = time.perf_counter()
         self.redraw()
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
 
         self._scene_cache = saved_scenes
         self._world_primitive_cache = saved_primitives
         self._thickness_legend = saved_legend
+        self._interactive_render = saved_interactive
+        self._animation_occluders = None
+
+        # Auto mode: once a frame overruns its slot, switch to the fast path
+        # and stay there for the rest of the playback.
+        if self._animation_fast is None and elapsed_ms > self._animation_frame_budget_ms:
+            self._animation_fast = True
 
         self._animation_frame_index = (self._animation_frame_index + 1) % len(self._animation_cache)
         delay_ms = max(1, int(1000.0 / self._animation_fps))
@@ -858,9 +1045,11 @@ class Tkinter3DCanvas(tk.Frame):
     def _invalidate_geometry_cache(self) -> None:
         self._world_primitive_cache.clear()
         self._scene_cache.clear()
+        self._quality_lod_flag = None
 
     def _clear_canvas_only(self) -> None:
         self.canvas.delete("all")
+        self._hud_signature = None
         self._polygon_pool.clear()
         self._polygon_state.clear()
         self._line_pool.clear()
@@ -949,38 +1138,130 @@ class Tkinter3DCanvas(tk.Frame):
     # Scene compilation
     # ------------------------------------------------------------------
 
+    def _quality_key(self, quality: str) -> str:
+        """
+        Collapse the two quality levels when they would produce the same thing.
+
+        Only cylinders and stiffeners re-tessellate for interactive frames;
+        a scene made of polygons and meshes - an FE result, for instance -
+        builds one identical primitive list either way.  Sharing it halves
+        both the build time and the memory, which matters most when caching
+        an animation frame by frame.
+        """
+        if quality != "fast":
+            return "full"
+        flag = self._quality_lod_flag
+        if flag is None:
+            flag = any(
+                obj.get("type") in ("cylinder", "stiffener") for obj in self.objects
+            )
+            self._quality_lod_flag = flag
+        return "fast" if flag else "full"
+
     def _get_world_primitives(self, quality: str) -> List[Dict[str, Any]]:
         """Return (and cache) the world-space primitive dictionaries."""
-        cached = self._world_primitive_cache.get(quality)
+        key = self._quality_key(quality)
+        cached = self._world_primitive_cache.get(key)
         if cached is not None:
             return cached
 
         primitives: List[Dict[str, Any]] = []
         for index, obj in enumerate(self.objects):
-            primitives.extend(self._object_to_primitives(obj, quality, index))
+            primitives.extend(self._object_to_primitives(obj, key, index))
 
         if self.show_axis_ruler:
             primitives.extend(self._get_ruler_primitives())
 
-        self._world_primitive_cache[quality] = primitives
+        self._world_primitive_cache[key] = primitives
         return primitives
 
     def _get_scene(self, quality: str) -> _CompiledScene:
-        scene = self._scene_cache.get(quality)
+        key = self._quality_key(quality)
+        scene = self._scene_cache.get(key)
         if scene is not None:
             return scene
-        scene = self._compile(self._get_world_primitives(quality))
-        self._scene_cache[quality] = scene
+        scene = self._compile(self._get_world_primitives(key))
+        self._scene_cache[key] = scene
         return scene
+
+    @staticmethod
+    def _resolve_stipples(primitive: Dict[str, Any]) -> Tuple[str, str]:
+        """
+        Front and back stipple patterns for one surface.
+
+        Front and back faces of a transparent surface get non-overlapping
+        stipple windows, so a shell shows its far wall through its near wall
+        instead of masking it.  An explicit stipple string is used verbatim:
+        the caller asked for that exact pattern.
+        """
+        explicit = primitive.get("stipple", "")
+        if explicit:
+            return explicit, explicit
+        opacity = primitive.get("opacity")
+        if opacity is None or float(opacity) >= stipple_module.OPAQUE_THRESHOLD:
+            return "", ""
+        rotation = int(primitive.get("stipple_phase", 0))
+        return (
+            stipple_module.for_opacity(opacity, 0, rotation),
+            stipple_module.for_opacity(opacity, 1, rotation),
+        )
+
+    @staticmethod
+    def _batch_centers_and_normals(
+        vertices: np.ndarray,
+        counts: np.ndarray,
+        offsets: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Centroids and Newell normals for a whole batch of faces at once.
+
+        This is the same maths :meth:`_polygon_normal` does per face, run as
+        array operations so that a mesh of tens of thousands of elements
+        never pays Python's per-face overhead.
+        """
+        centers = np.add.reduceat(vertices, offsets, axis=0) / counts[:, None]
+
+        # Pair every vertex with the next one *within its own face*, so the
+        # edge sum wraps at each face boundary instead of running on.
+        repeated_starts = np.repeat(offsets, counts)
+        repeated_counts = np.repeat(counts, counts)
+        position = np.arange(len(vertices), dtype=np.int64) - repeated_starts
+        following = repeated_starts + (position + 1) % repeated_counts
+
+        current = vertices
+        successor = vertices[following]
+        terms = np.empty_like(vertices)
+        terms[:, 0] = (current[:, 1] - successor[:, 1]) * (current[:, 2] + successor[:, 2])
+        terms[:, 1] = (current[:, 2] - successor[:, 2]) * (current[:, 0] + successor[:, 0])
+        terms[:, 2] = (current[:, 0] - successor[:, 0]) * (current[:, 1] + successor[:, 1])
+
+        normals = np.add.reduceat(terms, offsets, axis=0)
+        lengths = np.sqrt(np.einsum("ij,ij->i", normals, normals))
+        normals /= np.maximum(lengths, _EPS)[:, None]
+        normals[lengths <= _EPS] = 0.0
+        return centers.astype(np.float32, copy=False), normals.astype(np.float32, copy=False)
 
     def _compile(self, primitives: Sequence[Dict[str, Any]]) -> _CompiledScene:
         """Flatten primitive dictionaries into the per-frame array layout."""
         scene = _CompiledScene()
         scene.primitives = list(primitives)
 
-        face_vertices: List[Tuple[float, float, float]] = []
+        # Vertices arrive either one face at a time (polygons, lines) or as a
+        # ready-made array (batched faces).  Collecting blocks and joining them
+        # once at the end lets a batch skip the per-vertex Python entirely.
+        pending: List[Tuple[float, float, float]] = []
+        vertex_blocks: List[np.ndarray] = []
+        next_vertex = 0
+
+        def flush_pending() -> None:
+            if pending:
+                vertex_blocks.append(np.asarray(pending, dtype=np.float32))
+                pending.clear()
+
         face_start: List[int] = []
         face_count: List[int] = []
+        face_normal_blocks: List[np.ndarray] = []
+        face_center_blocks: List[np.ndarray] = []
         face_normal: List[Tuple[float, float, float]] = []
         face_center: List[Tuple[float, float, float]] = []
         face_layer: List[float] = []
@@ -991,6 +1272,13 @@ class Tkinter3DCanvas(tk.Frame):
         opaque: List[bool] = []
         fast_no_outline: List[bool] = []
 
+        def flush_face_attributes() -> None:
+            if face_normal:
+                face_normal_blocks.append(np.asarray(face_normal, dtype=np.float32))
+                face_center_blocks.append(np.asarray(face_center, dtype=np.float32))
+                face_normal.clear()
+                face_center.clear()
+
         line_vertices: List[Tuple[float, float, float]] = []
         line_layer: List[float] = []
         text_points: List[Tuple[float, float, float]] = []
@@ -1000,6 +1288,53 @@ class Tkinter3DCanvas(tk.Frame):
 
         for primitive in primitives:
             kind = primitive.get("kind")
+
+            if kind == "faces":
+                flush_pending()
+                flush_face_attributes()
+                vertices = primitive["vertices"]
+                counts = primitive["counts"]
+                total = len(counts)
+                offsets = np.zeros(total, dtype=np.int64)
+                np.cumsum(counts[:-1], out=offsets[1:])
+
+                centers, normals = self._batch_centers_and_normals(
+                    vertices, counts, offsets
+                )
+                face_center_blocks.append(centers)
+                face_normal_blocks.append(normals)
+                face_start.extend((offsets + next_vertex).tolist())
+                face_count.extend(counts.tolist())
+                vertex_blocks.append(vertices)
+                next_vertex += len(vertices)
+
+                layer = float(primitive.get("layer", 5))
+                two_sided = bool(primitive.get("two_sided_shell", False))
+                face_layer.extend([layer] * total)
+                face_phase.extend([0 if two_sided else 1] * total)
+                face_cull.extend([bool(primitive.get("cull_backface", False))] * total)
+                face_lit.extend([bool(primitive.get("lit", True))] * total)
+                face_is_edge.extend([False] * total)
+                fast_no_outline.extend(
+                    [bool(primitive.get("fast_no_outline", True))] * total
+                )
+
+                colors = primitive["colors"]
+                back_colors = primitive.get("back_colors") or colors
+                scene.base_front.extend(colors)
+                scene.base_back.extend(back_colors)
+                scene.outline.extend([primitive.get("outline", "")] * total)
+                scene.face_width.extend([primitive.get("width", 1)] * total)
+                tags = primitive.get("tags") or ""
+                scene.tags.extend([tags] * total)
+                if tags:
+                    scene.any_tags = True
+
+                front_stipple, back_stipple = self._resolve_stipples(primitive)
+                opaque.extend([not front_stipple] * total)
+                scene.stipple_front.extend([front_stipple] * total)
+                scene.stipple_back.extend([back_stipple] * total)
+                continue
 
             if kind == "text":
                 point = primitive["point"]
@@ -1030,8 +1365,8 @@ class Tkinter3DCanvas(tk.Frame):
                     continue
                 # Depth-sorted lines share the face pipeline: a four-point
                 # outline draws the segment and averages to its true midpoint.
-                face_start.append(len(face_vertices))
-                face_vertices.extend(
+                face_start.append(next_vertex)
+                pending.extend(
                     (
                         (start.x, start.y, start.z),
                         (end.x, end.y, end.z),
@@ -1039,6 +1374,7 @@ class Tkinter3DCanvas(tk.Frame):
                         (start.x, start.y, start.z),
                     )
                 )
+                next_vertex += 4
                 face_count.append(4)
                 face_normal.append((0.0, 0.0, 0.0))
                 face_center.append(
@@ -1068,8 +1404,9 @@ class Tkinter3DCanvas(tk.Frame):
                 continue
 
             vertices = primitive["vertices"]
-            face_start.append(len(face_vertices))
-            face_vertices.extend((v.x, v.y, v.z) for v in vertices)
+            face_start.append(next_vertex)
+            pending.extend((v.x, v.y, v.z) for v in vertices)
+            next_vertex += len(vertices)
             face_count.append(len(vertices))
             normal = primitive["normal"]
             center = primitive["center"]
@@ -1095,37 +1432,28 @@ class Tkinter3DCanvas(tk.Frame):
             if tags:
                 scene.any_tags = True
 
-            # Front and back faces of a transparent surface get non-overlapping
-            # stipple windows, so a shell shows its far wall through its near
-            # wall instead of masking it.  An explicit stipple string is used
-            # verbatim: the caller asked for that exact pattern.
-            explicit = primitive.get("stipple", "")
-            opacity = primitive.get("opacity")
-            rotation = int(primitive.get("stipple_phase", 0))
-            if explicit:
-                front_stipple = back_stipple = explicit
-            elif opacity is not None and float(opacity) < stipple_module.OPAQUE_THRESHOLD:
-                front_stipple = stipple_module.for_opacity(opacity, 0, rotation)
-                back_stipple = stipple_module.for_opacity(opacity, 1, rotation)
-            else:
-                front_stipple = back_stipple = ""
+            front_stipple, back_stipple = self._resolve_stipples(primitive)
             opaque.append(not front_stipple)
             scene.stipple_front.append(front_stipple)
             scene.stipple_back.append(back_stipple)
 
+        flush_pending()
+        flush_face_attributes()
+
         count = len(face_start)
         scene.face_vertices = (
-            np.asarray(face_vertices, dtype=np.float32)
-            if face_vertices
+            np.concatenate(vertex_blocks) if vertex_blocks
             else np.empty((0, 3), dtype=np.float32)
         )
         scene.face_start = np.asarray(face_start, dtype=np.int64) if count else np.empty(0, np.int64)
         scene.face_count = np.asarray(face_count, dtype=np.int64) if count else np.empty(0, np.int64)
         scene.face_normal = (
-            np.asarray(face_normal, dtype=np.float32) if count else np.empty((0, 3), np.float32)
+            np.concatenate(face_normal_blocks) if face_normal_blocks
+            else np.empty((0, 3), np.float32)
         )
         scene.face_center = (
-            np.asarray(face_center, dtype=np.float32) if count else np.empty((0, 3), np.float32)
+            np.concatenate(face_center_blocks) if face_center_blocks
+            else np.empty((0, 3), np.float32)
         )
         scene.face_layer = np.asarray(face_layer, dtype=np.float32) if count else np.empty(0, np.float32)
         scene.face_phase = np.asarray(face_phase, dtype=np.int8) if count else np.empty(0, np.int8)
@@ -1253,7 +1581,11 @@ class Tkinter3DCanvas(tk.Frame):
             return
 
         elapsed_ms = (now - previous) * 1000.0
-        budget_ms = float(self._interactive_delay_ms)
+        budget_ms = (
+            self._animation_frame_budget_ms
+            if self._is_playing_animation
+            else float(self._interactive_delay_ms)
+        )
         if elapsed_ms > 1.6 * budget_ms:
             self._fast_polygon_target = max(300, int(self._fast_polygon_target * 0.75))
         elif elapsed_ms < 1.15 * budget_ms:
@@ -1299,9 +1631,14 @@ class Tkinter3DCanvas(tk.Frame):
         # Hidden-member ray checks and stipple/legend drawing are restored on
         # mouse release.  Skipping them while dragging keeps orbiting responsive
         # on dense cylinder models without changing the final rendered view.
-        occluders = [] if interactive else self._collect_opaque_cylinder_occluders()
-
-        self.canvas.delete(_TAG_HUD)
+        if self._animation_occluders is not None:
+            # A replayed frame is tested against the occluders it was captured
+            # with, not against whatever `objects` holds right now.
+            occluders = self._animation_occluders
+        elif interactive:
+            occluders = []
+        else:
+            occluders = self._collect_opaque_cylinder_occluders()
 
         order, front, coords, clipped = self._visible_faces(
             scene,
@@ -1338,10 +1675,11 @@ class Tkinter3DCanvas(tk.Frame):
             scene, origin, basis, x_scale, y_scale, half_width, half_height, near, plot_width
         )
 
-        if not interactive and not self._is_capturing_animation:
-            self._draw_thickness_legend()
         if not self._is_capturing_animation:
-            self._draw_axis_indicator()
+            # The HUD is cached, so it no longer has to be dropped during
+            # interaction to stay responsive: the legend now stays put while
+            # orbiting and through animation playback.
+            self._draw_hud()
 
     def _visible_faces(
         self,
@@ -1787,16 +2125,33 @@ class Tkinter3DCanvas(tk.Frame):
 
     @staticmethod
     def _polygon_normal(vertices: Sequence[Point3D]) -> Point3D:
-        if len(vertices) < 3:
+        """
+        Newell's area-weighted normal.
+
+        It uses every edge rather than one vertex triple, so it stays correct
+        for concave and slightly non-planar faces, and it costs the same as
+        the single cross product it replaced.  The arithmetic is inlined on
+        raw floats because this runs once per face and FE result meshes bring
+        tens of thousands of them.
+        """
+        count = len(vertices)
+        if count < 3:
             return Point3D(0.0, 0.0, 0.0)
-        origin = vertices[0]
-        for index in range(1, len(vertices) - 1):
-            edge_1 = vertices[index] - origin
-            edge_2 = vertices[index + 1] - origin
-            normal = edge_1.cross(edge_2)
-            if normal.length() > _EPS:
-                return normal.normalized()
-        return Point3D(0.0, 0.0, 0.0)
+
+        normal_x = normal_y = normal_z = 0.0
+        previous = vertices[-1]
+        previous_x, previous_y, previous_z = previous.x, previous.y, previous.z
+        for vertex in vertices:
+            x, y, z = vertex.x, vertex.y, vertex.z
+            normal_x += (previous_y - y) * (previous_z + z)
+            normal_y += (previous_z - z) * (previous_x + x)
+            normal_z += (previous_x - x) * (previous_y + y)
+            previous_x, previous_y, previous_z = x, y, z
+
+        length = math.sqrt(normal_x * normal_x + normal_y * normal_y + normal_z * normal_z)
+        if length <= _EPS:
+            return Point3D(0.0, 0.0, 0.0)
+        return Point3D(normal_x / length, normal_y / length, normal_z / length)
 
     def _polygon_primitive(
         self,
@@ -1815,15 +2170,19 @@ class Tkinter3DCanvas(tk.Frame):
         stipple_phase: int = 0,
         opacity: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
-        if len(vertices) < 3:
-            return None
-        vertices_list = list(vertices)
+        vertices_list = vertices if type(vertices) is list else list(vertices)
         count = len(vertices_list)
-        center = Point3D(
-            sum(vertex.x for vertex in vertices_list) / count,
-            sum(vertex.y for vertex in vertices_list) / count,
-            sum(vertex.z for vertex in vertices_list) / count,
-        )
+        if count < 3:
+            return None
+
+        # One pass of scalar arithmetic instead of three generator sums: this
+        # is the hot loop when a scene is one polygon per finite element.
+        total_x = total_y = total_z = 0.0
+        for vertex in vertices_list:
+            total_x += vertex.x
+            total_y += vertex.y
+            total_z += vertex.z
+        center = Point3D(total_x / count, total_y / count, total_z / count)
         return {
             "kind": "polygon",
             "vertices": vertices_list,
@@ -1911,6 +2270,8 @@ class Tkinter3DCanvas(tk.Frame):
                 opacity=obj.get("opacity"),
             )
             return [primitive] if primitive else []
+        if object_type == "faces":
+            return [dict(obj, kind="faces", stipple_phase=object_index)]
         if object_type == "mesh":
             return self._mesh_primitives(obj, object_index)
         if object_type == "cylinder":
@@ -2781,6 +3142,80 @@ class Tkinter3DCanvas(tk.Frame):
             }
         )
 
+    def add_faces(
+        self,
+        polygons: Iterable[Any],
+        colors: Any = "#9aa7b4",
+        outline: str = "",
+        width: int = 1,
+        layer: int = 5,
+        cull_backface: bool = False,
+        opacity: float = 1.0,
+        stipple: str = "",
+        back_colors: Optional[Sequence[str]] = None,
+        tags: str = "",
+        lit: bool = True,
+        two_sided_shell: bool = False,
+    ) -> None:
+        """
+        Add many independent faces in one call, each with its own colour.
+
+        This is the fast path for result fields - an FE mesh coloured by
+        stress, a deformed shape, a utilisation plot - where every element is
+        a separate polygon with its own fill.  Adding them one at a time with
+        :meth:`add_polygon` costs a dictionary and a Python centroid/normal
+        per element; a batch stores one flat vertex array and computes all of
+        its centroids and normals as array operations.
+
+        ``polygons`` is a sequence of vertex sequences (``Point3D`` or
+        ``(x, y, z)``), or an ``(faces, vertices, 3)`` array when every face
+        has the same vertex count.  ``colors`` is one colour for the whole
+        batch or one per face.
+        """
+        vertices, counts = _flatten_polygons(polygons)
+        total = len(counts)
+        if total == 0:
+            return
+
+        if isinstance(colors, str):
+            color_list = [colors] * total
+        else:
+            color_list = [str(color) for color in colors]
+            if len(color_list) != total:
+                raise ValueError(
+                    f"colors has {len(color_list)} entries for {total} faces"
+                )
+        if back_colors is None:
+            back_list = None
+        else:
+            back_list = [str(color) for color in back_colors]
+            if len(back_list) != total:
+                raise ValueError(
+                    f"back_colors has {len(back_list)} entries for {total} faces"
+                )
+
+        if stipple or opacity < stipple_module.OPAQUE_THRESHOLD:
+            cull_backface = False
+
+        self._add_object(
+            {
+                "type": "faces",
+                "vertices": vertices,
+                "counts": counts,
+                "colors": color_list,
+                "back_colors": back_list,
+                "outline": outline,
+                "width": width,
+                "layer": int(layer),
+                "cull_backface": bool(cull_backface),
+                "opacity": float(opacity),
+                "stipple": stipple,
+                "tags": tags,
+                "lit": bool(lit),
+                "two_sided_shell": bool(two_sided_shell),
+            }
+        )
+
     def add_mesh(
         self,
         vertices: Iterable[Any],
@@ -3261,6 +3696,7 @@ class Tkinter3DCanvas(tk.Frame):
         back_color: str = "",
         nx: int = 24,
         ny: int = 24,
+        opacity: Optional[float] = None,
     ) -> None:
         dx = (x_end - x_start) / nx
         dy = (y_end - y_start) / ny
@@ -3280,6 +3716,7 @@ class Tkinter3DCanvas(tk.Frame):
                     color=color,
                     outline=outline,
                     stipple=stipple,
+                    opacity=opacity,
                     layer=layer,
                     back_color=back_color,
                 )
@@ -3298,6 +3735,7 @@ class Tkinter3DCanvas(tk.Frame):
         layer_web: int = 12,
         layer_flange: int = 13,
         nx: int = 24,
+        opacity: Optional[float] = None,
     ) -> None:
         dx = (x_end - x_start) / nx
         for i in range(nx):
@@ -3314,6 +3752,7 @@ class Tkinter3DCanvas(tk.Frame):
                 color=color,
                 outline=outline,
                 stipple=stipple,
+                opacity=opacity,
                 layer=layer_web,
             )
             # Flange
@@ -3328,6 +3767,7 @@ class Tkinter3DCanvas(tk.Frame):
                     color=color,
                     outline=outline,
                     stipple=stipple,
+                    opacity=opacity,
                     layer=layer_flange,
                 )
 
@@ -3345,6 +3785,7 @@ class Tkinter3DCanvas(tk.Frame):
         layer_web: int = 14,
         layer_flange: int = 15,
         ny: int = 24,
+        opacity: Optional[float] = None,
     ) -> None:
         dy = (y_end - y_start) / ny
         for j in range(ny):
@@ -3361,6 +3802,7 @@ class Tkinter3DCanvas(tk.Frame):
                 color=color,
                 outline=outline,
                 stipple=stipple,
+                opacity=opacity,
                 layer=layer_web,
             )
             # Flange
@@ -3375,6 +3817,7 @@ class Tkinter3DCanvas(tk.Frame):
                     color=color,
                     outline=outline,
                     stipple=stipple,
+                    opacity=opacity,
                     layer=layer_flange,
                 )
 
@@ -3467,6 +3910,13 @@ class Tkinter3DCanvas(tk.Frame):
                     zs = [point.z for point in mesh_points]
                     points.append(Point3D(min(xs), min(ys), min(zs)))
                     points.append(Point3D(max(xs), max(ys), max(zs)))
+            elif object_type == "faces":
+                vertices = obj.get("vertices")
+                if vertices is not None and len(vertices):
+                    low = vertices.min(axis=0)
+                    high = vertices.max(axis=0)
+                    points.append(Point3D(*low))
+                    points.append(Point3D(*high))
             elif object_type == "cylinder":
                 center = obj.get("center", Point3D(0.0, 0.0, 0.0))
                 radius = max(
