@@ -1,0 +1,13 @@
+# Ship the tests in the source distribution so a packager can verify a build
+# from the sdist alone.  Wheels are unaffected: they only carry src/anytk3d.
+include LICENSE
+include README.md
+include pyproject.toml
+recursive-include tests *.py
+
+prune build
+prune dist
+prune .idea
+prune .pytest_cache
+global-exclude *.py[cod]
+global-exclude __pycache__

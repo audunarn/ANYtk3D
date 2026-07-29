@@ -18,7 +18,7 @@ _EPS = 1.0e-12
 
 # Blue -> cyan -> green -> yellow -> orange -> red.  The interpolation is
 # implemented locally so the canvas keeps its zero-dependency design.
-_THICKNESS_COLOR_STOPS: Tuple[Tuple[float, str], ...] = (
+DEFAULT_COLOR_STOPS: Tuple[Tuple[float, str], ...] = (
     (0.00, "#313695"),
     (0.18, "#4575b4"),
     (0.36, "#74add1"),
@@ -29,6 +29,67 @@ _THICKNESS_COLOR_STOPS: Tuple[Tuple[float, str], ...] = (
     (0.95, "#f46d43"),
     (1.00, "#a50026"),
 )
+
+#: Historic name for the default scale.  Assigning to it does *not* change
+#: the colours any more - use :func:`set_color_stops`.
+_THICKNESS_COLOR_STOPS: Tuple[Tuple[float, str], ...] = DEFAULT_COLOR_STOPS
+
+_active_color_stops: Tuple[Tuple[float, str], ...] = DEFAULT_COLOR_STOPS
+
+#: Bumped whenever the scale changes, so a canvas can notice that colours it
+#: resolved earlier are stale and rebuild its scene.
+_color_stop_generation = 0
+
+
+def set_color_stops(stops: Any) -> Tuple[Tuple[float, str], ...]:
+    """
+    Replace the colour scale used by :func:`_interpolate_thickness_color`.
+
+    ``stops`` is an iterable of ``(position, colour)`` pairs with positions in
+    ``[0, 1]``; they are sorted and validated here.  This is how an
+    application swaps in a different colour map - a viridis or turbo ramp
+    sampled at a handful of positions, say - without needing to know how the
+    interpolation is implemented.
+
+    Colours a canvas has already resolved into its compiled scene are
+    refreshed on the next redraw; colours the caller resolved itself need
+    rebuilding by the caller.
+    """
+    global _active_color_stops, _color_stop_generation
+
+    cleaned: List[Tuple[float, str]] = []
+    for entry in stops:
+        position, color = entry
+        position = float(position)
+        if not math.isfinite(position):
+            raise ValueError(f"colour stop position must be finite, got {position!r}")
+        color = str(color)
+        if parse_color(color) is None:
+            raise ValueError(f"colour stop {color!r} is not a colour this module can read")
+        cleaned.append((min(1.0, max(0.0, position)), color))
+
+    if len(cleaned) < 2:
+        raise ValueError("a colour scale needs at least two stops")
+
+    cleaned.sort(key=lambda item: item[0])
+    _active_color_stops = tuple(cleaned)
+    _color_stop_generation += 1
+    return _active_color_stops
+
+
+def get_color_stops() -> Tuple[Tuple[float, str], ...]:
+    """The colour scale currently in use."""
+    return _active_color_stops
+
+
+def reset_color_stops() -> Tuple[Tuple[float, str], ...]:
+    """Restore the built-in blue-to-red scale."""
+    return set_color_stops(DEFAULT_COLOR_STOPS)
+
+
+def color_stop_generation() -> int:
+    """Counter that changes whenever the colour scale is replaced."""
+    return _color_stop_generation
 
 # Tk colour names that appear in the package defaults and in ANYstructure.
 # Resolving them locally avoids a round trip through the Tk interpreter when
@@ -127,27 +188,29 @@ def _interpolate_thickness_color(
     minimum: float,
     maximum: float,
 ) -> str:
+    """Map a value onto the active colour scale (see :func:`set_color_stops`)."""
     if maximum <= minimum + _EPS:
         position = 0.5
     else:
         position = (float(value) - minimum) / (maximum - minimum)
     position = max(0.0, min(1.0, position))
 
-    for index in range(len(_THICKNESS_COLOR_STOPS) - 1):
-        start_position, start_color = _THICKNESS_COLOR_STOPS[index]
-        end_position, end_color = _THICKNESS_COLOR_STOPS[index + 1]
+    stops = _active_color_stops
+    for index in range(len(stops) - 1):
+        start_position, start_color = stops[index]
+        end_position, end_color = stops[index + 1]
         if position <= end_position:
             span = max(_EPS, end_position - start_position)
             fraction = (position - start_position) / span
-            start_rgb = _hex_to_rgb(start_color)
-            end_rgb = _hex_to_rgb(end_color)
+            start_rgb = parse_color(start_color) or (0, 0, 0)
+            end_rgb = parse_color(end_color) or (0, 0, 0)
             return _rgb_to_hex(
                 start_rgb[0] + fraction * (end_rgb[0] - start_rgb[0]),
                 start_rgb[1] + fraction * (end_rgb[1] - start_rgb[1]),
                 start_rgb[2] + fraction * (end_rgb[2] - start_rgb[2]),
             )
 
-    return _THICKNESS_COLOR_STOPS[-1][1]
+    return stops[-1][1]
 
 
 def _flatten_numeric_values(value: Any) -> List[float]:

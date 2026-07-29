@@ -25,37 +25,48 @@ Run ``python -m anytk3d`` for a four-viewport demonstration, or
 ``python -m anytk3d.demo`` for the interactive showcase of shapes,
 lighting, FE result fields and animation.
 '''
-from . import shapes, shading, stipple
+from . import picking, shapes, shading, stipple
 from .canvas import (
+    DEFAULT_COLOR_STOPS,
     Camera3D,
     Light,
     Mesh,
     Point3D,
     Tkinter3DCanvas,
     create_stiffened_cylinder_demo,
+    get_color_stops,
     main,
     populate_fe_gui_cylinder,
     populate_fe_gui_plate,
     populate_shape_gallery,
     populate_stiffened_cylinder,
     populate_stiffened_plate,
+    reset_color_stops,
+    set_color_stops,
 )
+from .picking import Pick
 
-__version__ = "0.2.0"
+__version__ = "0.2.2"
 
 __all__ = [
+    "DEFAULT_COLOR_STOPS",
     "Camera3D",
     "Light",
     "Mesh",
+    "Pick",
     "Point3D",
     "Tkinter3DCanvas",
     "create_stiffened_cylinder_demo",
+    "get_color_stops",
     "main",
     "populate_fe_gui_cylinder",
     "populate_fe_gui_plate",
     "populate_shape_gallery",
     "populate_stiffened_cylinder",
     "populate_stiffened_plate",
+    "picking",
+    "reset_color_stops",
+    "set_color_stops",
     "shading",
     "shapes",
     "stipple",

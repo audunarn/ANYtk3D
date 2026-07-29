@@ -57,18 +57,24 @@ import numpy as np
 
 from . import shapes as shapes_module
 from . import stipple as stipple_module
+from .picking import Pick, PickState, entity_tag_at, modifiers_from_event
 from .core import (  # noqa: F401  (re-exported for backwards compatibility)
     _EPS,
     _NAMED_COLORS,
     _THICKNESS_COLOR_STOPS,
     Camera3D,
+    DEFAULT_COLOR_STOPS,
     Point3D,
     _flatten_numeric_values,
     _hex_to_rgb,
     _interpolate_thickness_color,
     _rgb_to_hex,
     as_point,
+    color_stop_generation,
+    get_color_stops,
     parse_color,
+    reset_color_stops,
+    set_color_stops,
 )
 from .shading import (  # noqa: F401  (part of the public surface)
     Light,
@@ -82,12 +88,16 @@ from .shading import (  # noqa: F401  (part of the public surface)
 from .shapes import Mesh
 
 __all__ = [
+    "DEFAULT_COLOR_STOPS",
     "Camera3D",
     "Light",
     "Mesh",
     "Point3D",
     "Tkinter3DCanvas",
     "create_stiffened_cylinder_demo",
+    "get_color_stops",
+    "reset_color_stops",
+    "set_color_stops",
     "main",
     "populate_fe_gui_cylinder",
     "populate_fe_gui_plate",
@@ -110,6 +120,16 @@ _TAG_HUD_AXIS = "_tk3d_hud_axis"
 # the face pool, and a specific tag so each can be rebuilt on its own.
 _HUD_LEGEND_TAGS = (_TAG_HUD, _TAG_HUD_LEGEND)
 _HUD_AXIS_TAGS = (_TAG_HUD, _TAG_HUD_AXIS)
+
+# The renderer's own pool tags.  Picking never returns these, so a caller tag
+# is always what comes back.
+_RESERVED_TAGS = frozenset(
+    {_TAG_POLYGON, _TAG_LINE, _TAG_TEXT, _TAG_HUD, _TAG_HUD_LEGEND, _TAG_HUD_AXIS}
+)
+
+# How far the cursor may travel between press and release and still count as a
+# click rather than a pan.
+_PICK_CLICK_SLOP = 3
 
 # Screen coordinates are clamped before reaching Tk: enormous values from
 # near-plane grazing geometry slow the rasteriser down for no visible gain.
@@ -196,6 +216,7 @@ class _CompiledScene:
         "line_color",
         "line_width",
         "line_layer",
+        "line_tags",
         "text_points",
         "text_layer",
         "text_content",
@@ -232,6 +253,7 @@ class _CompiledScene:
         self.line_vertices = np.empty((0, 3), dtype=np.float32)
         self.line_color: List[str] = []
         self.line_width: List[int] = []
+        self.line_tags: List[str] = []
         self.line_layer = np.empty(0, dtype=np.float32)
         self.text_points = np.empty((0, 3), dtype=np.float32)
         self.text_layer = np.empty(0, dtype=np.float32)
@@ -307,6 +329,7 @@ class Tkinter3DCanvas(tk.Frame):
         self._world_primitive_cache: Dict[str, List[Dict[str, Any]]] = {}
         self._scene_cache: Dict[str, _CompiledScene] = {}
         self._quality_lod_flag: Optional[bool] = None
+        self._color_stop_generation = color_stop_generation()
 
         # Animation Cache Fields
         self._animation_cache: List[Dict[str, Any]] = []
@@ -333,11 +356,18 @@ class Tkinter3DCanvas(tk.Frame):
         self._text_pool: List[int] = []
         self._text_state: List[Optional[Tuple[Any, ...]]] = []
 
+        # Picking is opt-in: without a callback the handlers below do nothing,
+        # so existing applications keep exactly their previous behaviour.
+        self._pick = PickState()
+
         self.bind("<Destroy>", self._on_destroy, add="+")
         self.canvas.bind("<Configure>", self._on_resize, add="+")
         self.canvas.bind("<ButtonPress-1>", lambda event: self._on_mouse_down(event, "pan"), add="+")
         self.canvas.bind("<B1-Motion>", self._on_mouse_drag, add="+")
         self.canvas.bind("<ButtonRelease-1>", self._on_mouse_up, add="+")
+        self.canvas.bind("<ButtonPress-1>", self._on_pick_press, add="+")
+        self.canvas.bind("<ButtonRelease-1>", self._on_pick_release, add="+")
+        self.canvas.bind("<Motion>", self._on_pick_motion, add="+")
         self.canvas.bind("<ButtonPress-3>", lambda event: self._on_mouse_down(event, "rotate"), add="+")
         self.canvas.bind("<B3-Motion>", self._on_mouse_drag, add="+")
         self.canvas.bind("<ButtonRelease-3>", self._on_mouse_up, add="+")
@@ -831,6 +861,134 @@ class Tkinter3DCanvas(tk.Frame):
         self.height = new_height
         self._request_redraw()
 
+    # ------------------------------------------------------------------
+    # picking, hover and highlight
+    # ------------------------------------------------------------------
+    def set_pick_callback(
+        self,
+        callback: Optional[Any],
+        *,
+        prefix: str = "",
+        radius: Optional[int] = None,
+    ) -> None:
+        """Call ``callback(pick)`` when the user clicks without dragging.
+
+        ``prefix`` restricts hits to tags the caller owns.  A click on empty
+        space still fires, with an empty ``pick.tag``, so the application can
+        clear its selection.
+        """
+
+        self._pick.pick_callback = callback
+        self._pick.prefix = str(prefix)
+        if radius is not None:
+            self._pick.radius = max(0, int(radius))
+
+    def set_hover_callback(self, callback: Optional[Any]) -> None:
+        """Call ``callback(pick_or_None)`` when the tag under the cursor changes."""
+
+        self._pick.hover_callback = callback
+        self._pick.hover_tag = None
+
+    def pick_at(self, x: int, y: int) -> Optional[str]:
+        """The topmost caller tag at a canvas position, or None."""
+
+        tag, _item = entity_tag_at(
+            self.canvas,
+            int(x),
+            int(y),
+            prefix=self._pick.prefix,
+            reserved=_RESERVED_TAGS,
+            radius=self._pick.radius,
+        )
+        return tag
+
+    def set_highlight(
+        self,
+        tags: Iterable[str],
+        fill: Optional[str] = None,
+        outline: Optional[str] = None,
+    ) -> None:
+        """Tint every face carrying one of ``tags``.
+
+        The tint is applied while rendering rather than by reconfiguring Tk
+        items directly, so it survives the next redraw.
+        """
+
+        if self._pick.set_highlight(tags, fill=fill, outline=outline):
+            self._request_redraw()
+
+    def clear_highlight(self) -> None:
+        self.set_highlight(())
+
+    def highlighted_tags(self) -> frozenset:
+        return self._pick.highlight_tags
+
+    def _on_pick_press(self, event: tk.Event) -> None:
+        if self._pick.pick_callback is None:
+            return
+        self._pick.press = (int(event.x), int(event.y))
+
+    def _on_pick_release(self, event: tk.Event) -> None:
+        state = self._pick
+        callback = state.pick_callback
+        press = state.press
+        state.press = None
+        if callback is None or press is None:
+            return
+
+        x, y = int(event.x), int(event.y)
+        if (
+            abs(x - press[0]) > _PICK_CLICK_SLOP
+            or abs(y - press[1]) > _PICK_CLICK_SLOP
+        ):
+            # The user was panning, not selecting.
+            return
+
+        tag, item = entity_tag_at(
+            self.canvas,
+            x,
+            y,
+            prefix=state.prefix,
+            reserved=_RESERVED_TAGS,
+            radius=state.radius,
+        )
+        shift, ctrl, alt = modifiers_from_event(event)
+        callback(
+            Pick(
+                tag=tag or "",
+                item=-1 if item is None else int(item),
+                x=x,
+                y=y,
+                shift=shift,
+                ctrl=ctrl,
+                alt=alt,
+            )
+        )
+
+    def _on_pick_motion(self, event: tk.Event) -> None:
+        state = self._pick
+        callback = state.hover_callback
+        if callback is None or self._is_dragging:
+            return
+
+        x, y = int(event.x), int(event.y)
+        tag, item = entity_tag_at(
+            self.canvas,
+            x,
+            y,
+            prefix=state.prefix,
+            reserved=_RESERVED_TAGS,
+            radius=state.radius,
+        )
+        if tag == state.hover_tag:
+            return
+        state.hover_tag = tag
+        callback(
+            None
+            if tag is None
+            else Pick(tag=tag, item=-1 if item is None else int(item), x=x, y=y)
+        )
+
     def _on_mouse_down(self, event: tk.Event, mode: str) -> None:
         self._last_mouse_x = int(event.x)
         self._last_mouse_y = int(event.y)
@@ -1176,6 +1334,13 @@ class Tkinter3DCanvas(tk.Frame):
         return primitives
 
     def _get_scene(self, quality: str) -> _CompiledScene:
+        # Colours the scene resolved through the shared scale go stale when
+        # the application swaps colour maps, so drop the cache on a change.
+        generation = color_stop_generation()
+        if generation != self._color_stop_generation:
+            self._color_stop_generation = generation
+            self._invalidate_geometry_cache()
+
         key = self._quality_key(quality)
         scene = self._scene_cache.get(key)
         if scene is not None:
@@ -1361,6 +1526,8 @@ class Tkinter3DCanvas(tk.Frame):
                     line_vertices.append((end.x, end.y, end.z))
                     scene.line_color.append(color)
                     scene.line_width.append(width)
+                    overlay_tags = primitive.get("tags") or ""
+                    scene.line_tags.append(overlay_tags)
                     line_layer.append(layer)
                     continue
                 # Depth-sorted lines share the face pipeline: a four-point
@@ -1397,7 +1564,10 @@ class Tkinter3DCanvas(tk.Frame):
                 scene.stipple_front.append("")
                 scene.stipple_back.append("")
                 scene.face_width.append(width)
-                scene.tags.append("")
+                line_tags = primitive.get("tags") or ""
+                scene.tags.append(line_tags)
+                if line_tags:
+                    scene.any_tags = True
                 continue
 
             if kind != "polygon":
@@ -1893,6 +2063,12 @@ class Tkinter3DCanvas(tk.Frame):
         opaque = scene.opaque
         is_edge = scene.face_is_edge
 
+        # Resolved once per scene and highlight generation, so orbiting a
+        # highlighted model does not re-split every tag string every frame.
+        highlighted = self._pick.highlighted_faces(scene)
+        highlight_fill = self._pick.highlight_fill
+        highlight_outline = self._pick.highlight_outline
+
         for slot, face in enumerate(order):
             item = pool[slot]
             face_coords = clipped.get(face)
@@ -1921,6 +2097,12 @@ class Tkinter3DCanvas(tk.Frame):
                 outline = fill if opaque[face] else ""
             else:
                 outline = outlines[face]
+
+            if highlighted is not None and face in highlighted:
+                fill = highlight_fill
+                # Always stroke a highlighted face, even when mesh lines are
+                # off, so the selection reads against its neighbours.
+                outline = highlight_outline
 
             state = (fill, outline, widths[face], stipple, tags[face])
             if states[slot] != state:
@@ -1989,21 +2171,24 @@ class Tkinter3DCanvas(tk.Frame):
         states = self._line_state
         colors = scene.line_color
         widths = scene.line_width
+        line_tags = scene.line_tags
+        any_line_tags = any(line_tags)
 
         for slot, line in enumerate(index.tolist()):
             item = pool[slot]
             call((widget, "coords", item, round(float(x0[line])), round(float(y0[line])),
                   round(float(x1[line])), round(float(y1[line]))))
-            state = (colors[line], widths[line])
+            tag = line_tags[line] if any_line_tags else ""
+            state = (colors[line], widths[line], tag)
             if states[slot] != state:
-                call(
-                    (
-                        widget, "itemconfigure", item,
-                        "-fill", colors[line],
-                        "-width", widths[line],
-                        "-state", "normal",
-                    )
+                options = (
+                    "-fill", colors[line],
+                    "-width", widths[line],
+                    "-state", "normal",
                 )
+                if any_line_tags:
+                    options += ("-tags", (_TAG_LINE + " " + tag).strip())
+                call((widget, "itemconfigure", item) + options)
                 states[slot] = state
 
         self._hide_unused(self._line_pool, self._line_state, needed)
@@ -2211,6 +2396,7 @@ class Tkinter3DCanvas(tk.Frame):
         width: int,
         layer: int = 30,
         draw_overlay: bool = False,
+        tags: str = "",
     ) -> Dict[str, Any]:
         return {
             "kind": "line",
@@ -2220,6 +2406,7 @@ class Tkinter3DCanvas(tk.Frame):
             "width": width,
             "layer": layer,
             "draw_overlay": bool(draw_overlay),
+            "tags": tags,
         }
 
     def _object_to_primitives(
@@ -2238,6 +2425,7 @@ class Tkinter3DCanvas(tk.Frame):
                     obj.get("width", 1),
                     layer=int(obj.get("layer", 30)),
                     draw_overlay=bool(obj.get("draw_overlay", False)),
+                    tags=obj.get("tags", ""),
                 )
             ]
         if object_type == "text":
@@ -3073,6 +3261,7 @@ class Tkinter3DCanvas(tk.Frame):
         width: int = 1,
         layer: int = 30,
         draw_overlay: bool = False,
+        tags: str = "",
     ) -> None:
         self._add_object(
             {
@@ -3083,6 +3272,7 @@ class Tkinter3DCanvas(tk.Frame):
                 "width": width,
                 "layer": int(layer),
                 "draw_overlay": bool(draw_overlay),
+                "tags": tags,
             }
         )
 

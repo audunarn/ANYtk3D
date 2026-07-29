@@ -114,6 +114,52 @@ canvas.add_sphere(2.0, color='#7fb3d5', opacity=0.35)   # see the contents
 canvas.add_box(1.0, 1.0, 1.0, color='#c0392b')          # ...through the shell
 ```
 
+### Picking and highlighting
+
+Every shape builder takes `tags`, and those tags reach the underlying Tk
+canvas item. Picking uses Tk's own hit testing, so the topmost item under the
+cursor is the nearest one — no ray casting, and occlusion is correct for free.
+
+```python
+canvas.add_box(2, 1, 0.5, tags='plate7')
+
+def on_pick(pick):
+    print(pick.tag, pick.shift)          # '' when the click missed everything
+    canvas.set_highlight([pick.tag] if pick.tag else [])
+
+canvas.set_pick_callback(on_pick, prefix='plate')   # prefix is optional
+canvas.set_hover_callback(lambda pick: ...)         # fires only on change
+canvas.pick_at(x, y)                                # query without an event
+```
+
+A click is a press and release without a drag, so picking coexists with pan
+and orbit. Highlighting is applied while rendering rather than by
+reconfiguring Tk items, so it survives the next redraw; the resolution from
+tags to faces is cached per scene and highlight generation.
+
+Picking is opt-in — with no callback set, the canvas behaves exactly as before.
+
+### Colour scale
+
+Plate colour-coding, the legend and `thickness_color` all share one scale.
+Replace it to use a different colour map — sample any ramp at a handful of
+positions and hand the stops over:
+
+```python
+from matplotlib import colormaps, colors   # only if you want matplotlib maps
+import anytk3d
+
+stops = [(t / 16, colors.to_hex(colormaps['viridis'](t / 16))) for t in range(17)]
+anytk3d.set_color_stops(stops)
+anytk3d.get_color_stops()
+anytk3d.reset_color_stops()                # back to the built-in blue→red ramp
+```
+
+Colours a canvas resolved itself (cylinder plate thickness, stiffener
+thickness) refresh on the next redraw. `anytk3d.DEFAULT_COLOR_STOPS` is the
+built-in scale; assigning to the old `_THICKNESS_COLOR_STOPS` constant has no
+effect — use `set_color_stops`.
+
 ### Result fields
 
 `add_faces` is the batched path for a mesh where every element carries its
