@@ -217,6 +217,7 @@ stiffened cylinder — is a single file you can run straight from an IDE
 
 ```bash
 python -m anytk3d.demo
+python run_gui.py
 ```
 
 The original four-viewport demo is still there:
