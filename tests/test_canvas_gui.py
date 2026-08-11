@@ -58,6 +58,20 @@ def test_primitives_and_thickness_legend(root):
     assert any(obj.get('type') == 'cylinder' for obj in canvas.objects)
 
 
+def test_legend_accepts_result_palette_colors(root):
+    canvas = Tkinter3DCanvas(root, width=500, height=300)
+    canvas.pack()
+    levels = [0.0, 50.0, 100.0]
+    colors = ["#440154", "#21918c", "#fde725"]
+    canvas.set_thickness_legend(
+        levels, unit="MPa", title="von Mises", colors=colors
+    )
+    root.update()
+
+    assert canvas._thickness_legend["colors"] == colors
+    assert canvas._legend_color(canvas._thickness_legend, 50.0) == colors[1]
+
+
 def test_camera_orbit_and_zoom(root):
     canvas = Tkinter3DCanvas(root, width=400, height=300, bg='white')
     canvas.add_cylinder(radius=1.0, height=4.0, center=Point3D(0.0, 0.0, 2.0))

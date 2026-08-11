@@ -445,3 +445,54 @@ class Camera3D:
             (camera_x * scale / aspect / depth + 1.0) * 0.5 * width,
             (1.0 - camera_y * scale / depth) * 0.5 * height,
         )
+
+    def screen_ray(
+        self,
+        x: float,
+        y: float,
+        width: int,
+        height: int,
+    ) -> Tuple[Point3D, Point3D]:
+        """World-space ray from the camera through one viewport pixel."""
+
+        width = max(1, int(width))
+        height = max(1, int(height))
+        ndc_x = 2.0 * float(x) / float(width) - 1.0
+        ndc_y = 1.0 - 2.0 * float(y) / float(height)
+        tangent = math.tan(self.fov / 2.0)
+        aspect = float(width) / float(height)
+        right, camera_up, forward = self.basis()
+        direction = (
+            forward
+            + right * (ndc_x * aspect * tangent)
+            + camera_up * (ndc_y * tangent)
+        ).normalized()
+        return Point3D(self.position.x, self.position.y, self.position.z), direction
+
+    def unproject_to_plane(
+        self,
+        x: float,
+        y: float,
+        width: int,
+        height: int,
+        plane_point: Point3D,
+        plane_normal: Point3D,
+    ) -> Optional[Point3D]:
+        """Intersect a screen ray with a world-space plane.
+
+        ``None`` means the ray is parallel to the plane or the intersection is
+        behind the camera.
+        """
+
+        origin, direction = self.screen_ray(x, y, width, height)
+        normal = as_point(plane_normal).normalized()
+        if normal.length() <= _EPS:
+            raise ValueError("plane normal must be non-zero")
+        point = as_point(plane_point)
+        denominator = direction.dot(normal)
+        if abs(denominator) <= _EPS:
+            return None
+        distance = (point - origin).dot(normal) / denominator
+        if distance < 0.0:
+            return None
+        return origin + direction * distance

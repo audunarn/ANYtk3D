@@ -139,6 +139,38 @@ tags to faces is cached per scene and highlight generation.
 
 Picking is opt-in — with no callback set, the canvas behaves exactly as before.
 
+For CAD/FE-style interaction, opt into the commercial profile. LMB selects
+and draws a directional box, MMB pans, RMB orbits, and the wheel zooms. A
+left-to-right box requires full containment; right-to-left is crossing.
+
+```python
+from anytk3d import (
+    PickBinding, SelectionConfig, SelectionDepth, SelectionFilter,
+)
+
+canvas = Tkinter3DCanvas(root, interaction_profile="commercial")
+canvas.add_faces(
+    element_polygons,
+    bindings=[
+        PickBinding.one(f"element{number}", "mesh.element")
+        for number in element_numbers
+    ],
+)
+canvas.configure_selection(
+    lambda event: print(event.operation, [hit.key for hit in event.hits]),
+    hover_callback=lambda hit: print(None if hit is None else hit.key),
+    config=SelectionConfig(
+        filter=SelectionFilter(kinds=frozenset({"mesh.element"})),
+        depth=SelectionDepth.VISIBLE,
+    ),
+)
+```
+
+No modifier replaces the selection, Shift adds, Ctrl toggles, and Alt
+removes. `query_point`, `query_rectangle`, `screen_ray`, and
+`unproject_to_plane` expose the same projected geometry for modelling tools.
+The default interaction profile remains `legacy` for compatibility.
+
 ### Colour scale
 
 Plate colour-coding, the legend and `thickness_color` all share one scale.
@@ -240,6 +272,17 @@ original API (`Tkinter3DCanvas`, `Point3D`, `Camera3D` and every
 ```bash
 pip install -e .[dev]
 pytest
+```
+
+The regular suite uses deterministic Tk-generated events and never moves the
+desktop pointer. A small Windows-native acceptance suite covers event
+translation that synthetic Tk events cannot reproduce: hover/click and
+selection modifiers, directional window/crossing selection, plus middle-pan,
+right-orbit and wheel zoom. Run it only on an interactive Windows desktop:
+
+```powershell
+$env:ANYTK3D_RUN_NATIVE_GUI = "1"
+python -m pytest tests/test_native_gui_acceptance.py -q
 ```
 
 ## License

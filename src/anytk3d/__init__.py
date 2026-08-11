@@ -44,7 +44,19 @@ from .canvas import (
     reset_color_stops,
     set_color_stops,
 )
-from .picking import Pick
+from .picking import (
+    Pick,
+    PickBinding,
+    PickOwner,
+    SelectionConfig,
+    SelectionDepth,
+    SelectionEvent,
+    SelectionFilter,
+    SelectionGesture,
+    SelectionHit,
+    SelectionOperation,
+    SelectionTool,
+)
 
 __version__ = "0.2.2"
 
@@ -54,7 +66,17 @@ __all__ = [
     "Light",
     "Mesh",
     "Pick",
+    "PickBinding",
+    "PickOwner",
     "Point3D",
+    "SelectionConfig",
+    "SelectionDepth",
+    "SelectionEvent",
+    "SelectionFilter",
+    "SelectionGesture",
+    "SelectionHit",
+    "SelectionOperation",
+    "SelectionTool",
     "Tkinter3DCanvas",
     "create_stiffened_cylinder_demo",
     "get_color_stops",

@@ -49,15 +49,35 @@ The cylinder axis is the global Z axis.
 from __future__ import annotations
 
 import math
+import sys
 import time
 import tkinter as tk
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from dataclasses import replace
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 from . import shapes as shapes_module
 from . import stipple as stipple_module
-from .picking import Pick, PickState, entity_tag_at, modifiers_from_event
+from .picking import (
+    Pick,
+    PickBinding,
+    PickOwner,
+    PickState,
+    SelectionConfig,
+    SelectionDepth,
+    SelectionEvent,
+    SelectionFilter,
+    SelectionGesture,
+    SelectionHit,
+    SelectionOperation,
+    SelectionTool,
+    entity_tag_at,
+    fallback_binding,
+    modifiers_from_event,
+    operation_from_modifiers,
+)
+from ._selection import ProjectedPrimitive, ProjectedSelectionIndex
 from .core import (  # noqa: F401  (re-exported for backwards compatibility)
     _EPS,
     _NAMED_COLORS,
@@ -92,7 +112,17 @@ __all__ = [
     "Camera3D",
     "Light",
     "Mesh",
+    "PickBinding",
+    "PickOwner",
     "Point3D",
+    "SelectionConfig",
+    "SelectionDepth",
+    "SelectionEvent",
+    "SelectionFilter",
+    "SelectionGesture",
+    "SelectionHit",
+    "SelectionOperation",
+    "SelectionTool",
     "Tkinter3DCanvas",
     "create_stiffened_cylinder_demo",
     "get_color_stops",
@@ -112,6 +142,8 @@ __all__ = [
 _TAG_POLYGON = "_tk3d_face"
 _TAG_LINE = "_tk3d_line"
 _TAG_TEXT = "_tk3d_text"
+_TAG_MARKER = "_tk3d_marker"
+_TAG_SELECTION = "_tk3d_selection"
 _TAG_HUD = "_tk3d_hud"
 _TAG_HUD_LEGEND = "_tk3d_hud_legend"
 _TAG_HUD_AXIS = "_tk3d_hud_axis"
@@ -124,7 +156,16 @@ _HUD_AXIS_TAGS = (_TAG_HUD, _TAG_HUD_AXIS)
 # The renderer's own pool tags.  Picking never returns these, so a caller tag
 # is always what comes back.
 _RESERVED_TAGS = frozenset(
-    {_TAG_POLYGON, _TAG_LINE, _TAG_TEXT, _TAG_HUD, _TAG_HUD_LEGEND, _TAG_HUD_AXIS}
+    {
+        _TAG_POLYGON,
+        _TAG_LINE,
+        _TAG_TEXT,
+        _TAG_MARKER,
+        _TAG_SELECTION,
+        _TAG_HUD,
+        _TAG_HUD_LEGEND,
+        _TAG_HUD_AXIS,
+    }
 )
 
 # How far the cursor may travel between press and release and still count as a
@@ -182,6 +223,30 @@ def _flatten_polygons(polygons: Iterable[Any]) -> Tuple[np.ndarray, np.ndarray]:
     )
 
 
+def _coerce_pick_binding(value: Any, tags: str = "") -> Optional[PickBinding]:
+    if value is None:
+        return fallback_binding(tags)
+    if isinstance(value, PickBinding):
+        return value
+    if isinstance(value, PickOwner):
+        return PickBinding((value,))
+    if isinstance(value, str):
+        return PickBinding.one(value)
+    raise TypeError("binding must be PickBinding, PickOwner, string, or None")
+
+
+def _coerce_pick_bindings(
+    value: Any, total: int, tags: str = ""
+) -> List[Optional[PickBinding]]:
+    if value is None or isinstance(value, (PickBinding, PickOwner, str)):
+        binding = _coerce_pick_binding(value, tags)
+        return [binding] * total
+    bindings = [_coerce_pick_binding(binding, tags) for binding in value]
+    if len(bindings) != total:
+        raise ValueError(f"bindings has {len(bindings)} entries for {total} primitives")
+    return bindings
+
+
 class _CompiledScene:
     """Flat array form of a primitive list, ready for per-frame projection."""
 
@@ -211,12 +276,21 @@ class _CompiledScene:
         "opaque",
         "fast_no_outline",
         "tags",
+        "face_bindings",
         "any_tags",
         "line_vertices",
         "line_color",
         "line_width",
         "line_layer",
         "line_tags",
+        "line_bindings",
+        "marker_points",
+        "marker_colors",
+        "marker_outlines",
+        "marker_sizes",
+        "marker_layers",
+        "marker_tags",
+        "marker_bindings",
         "text_points",
         "text_layer",
         "text_content",
@@ -249,12 +323,21 @@ class _CompiledScene:
         self.opaque = np.empty(0, dtype=bool)
         self.fast_no_outline = np.empty(0, dtype=bool)
         self.tags: List[str] = []
+        self.face_bindings: List[Optional[PickBinding]] = []
         self.any_tags = False
         self.line_vertices = np.empty((0, 3), dtype=np.float32)
         self.line_color: List[str] = []
         self.line_width: List[int] = []
         self.line_tags: List[str] = []
+        self.line_bindings: List[Optional[PickBinding]] = []
         self.line_layer = np.empty(0, dtype=np.float32)
+        self.marker_points = np.empty((0, 3), dtype=np.float32)
+        self.marker_colors: List[str] = []
+        self.marker_outlines: List[str] = []
+        self.marker_sizes: List[int] = []
+        self.marker_layers = np.empty(0, dtype=np.float32)
+        self.marker_tags: List[str] = []
+        self.marker_bindings: List[Optional[PickBinding]] = []
         self.text_points = np.empty((0, 3), dtype=np.float32)
         self.text_layer = np.empty(0, dtype=np.float32)
         self.text_content: List[Tuple[str, str, Any, str]] = []
@@ -276,6 +359,7 @@ class Tkinter3DCanvas(tk.Frame):
         bg: str = "white",
         interactive_fps: int = 40,
         shading: bool = True,
+        interaction_profile: str = "legacy",
         **canvas_kwargs: Any,
     ) -> None:
         super().__init__(master, background=bg)
@@ -355,25 +439,62 @@ class Tkinter3DCanvas(tk.Frame):
         self._line_state: List[Optional[Tuple[Any, ...]]] = []
         self._text_pool: List[int] = []
         self._text_state: List[Optional[Tuple[Any, ...]]] = []
+        self._marker_pool: List[int] = []
+        self._marker_state: List[Optional[Tuple[Any, ...]]] = []
 
         # Picking is opt-in: without a callback the handlers below do nothing,
         # so existing applications keep exactly their previous behaviour.
         self._pick = PickState()
 
+        # The commercial profile is deliberately opt-in for the 0.x series.
+        # It reserves LMB for click/window selection, moves pan to MMB, and
+        # leaves orbit on RMB.  The legacy profile keeps LMB pan + click-pick.
+        self._interaction_profile = ""
+        self._selection_config = SelectionConfig()
+        self._selection_callback: Optional[Callable[[SelectionEvent], None]] = None
+        self._selection_hover_callback: Optional[
+            Callable[[Optional[SelectionHit]], None]
+        ] = None
+        self._selection_index: Optional[ProjectedSelectionIndex] = None
+        self._selection_index_key: Optional[Tuple[Any, ...]] = None
+        self._selection_press: Optional[Tuple[int, int]] = None
+        self._selection_modifiers = (False, False, False)
+        self._selection_dragging = False
+        self._selection_points: List[Tuple[int, int]] = []
+        self._selection_overlay: Optional[int] = None
+        self._selection_committed_on_press = False
+        self._selection_press_hit_keys: frozenset[str] = frozenset()
+        self._hover_after_id: Optional[str] = None
+        self._hover_position: Optional[Tuple[int, int]] = None
+        self._hover_key: Optional[str] = None
+        self._cycle_signature: Optional[Tuple[Any, ...]] = None
+        self._cycle_anchor: Optional[Tuple[int, int]] = None
+        self._cycle_index = -1
+        self._cycle_time = 0.0
+        self._tracked_modifiers = {"shift": False, "ctrl": False, "alt": False}
+        self._interaction_bindings: List[Tuple[str, str]] = []
+        # Tk normally sends ButtonRelease back to the grabbed canvas, but on
+        # Windows a real mouse release can occasionally land only on the
+        # toplevel binding tag (notably after focus/menu transitions).  Keep a
+        # second, instance-specific release binding so a visible selection
+        # overlay can never be left waiting for a release that already
+        # happened.  The normal canvas handler runs first and clears the press,
+        # making this callback a no-op in the common path.
+        self._selection_release_toplevel = self.winfo_toplevel()
+        self._selection_release_binding = self._selection_release_toplevel.bind(
+            "<ButtonRelease-1>", self._on_toplevel_selection_release, add="+"
+        )
+
         self.bind("<Destroy>", self._on_destroy, add="+")
         self.canvas.bind("<Configure>", self._on_resize, add="+")
-        self.canvas.bind("<ButtonPress-1>", lambda event: self._on_mouse_down(event, "pan"), add="+")
-        self.canvas.bind("<B1-Motion>", self._on_mouse_drag, add="+")
-        self.canvas.bind("<ButtonRelease-1>", self._on_mouse_up, add="+")
-        self.canvas.bind("<ButtonPress-1>", self._on_pick_press, add="+")
-        self.canvas.bind("<ButtonRelease-1>", self._on_pick_release, add="+")
-        self.canvas.bind("<Motion>", self._on_pick_motion, add="+")
-        self.canvas.bind("<ButtonPress-3>", lambda event: self._on_mouse_down(event, "rotate"), add="+")
-        self.canvas.bind("<B3-Motion>", self._on_mouse_drag, add="+")
-        self.canvas.bind("<ButtonRelease-3>", self._on_mouse_up, add="+")
         self.canvas.bind("<MouseWheel>", self._on_mouse_wheel, add="+")
         self.canvas.bind("<Button-4>", self._on_mouse_wheel, add="+")
         self.canvas.bind("<Button-5>", self._on_mouse_wheel, add="+")
+        self.canvas.bind("<KeyPress>", self._on_modifier_key, add="+")
+        self.canvas.bind("<KeyRelease>", self._on_modifier_key, add="+")
+        self.canvas.bind("<Escape>", self._cancel_selection_gesture, add="+")
+        self.canvas.bind("<FocusOut>", self._on_selection_focus_out, add="+")
+        self.set_interaction_profile(interaction_profile)
 
         self.after_idle(self._request_redraw)
 
@@ -482,6 +603,7 @@ class Tkinter3DCanvas(tk.Frame):
         title: str = "Plate thickness",
         width: int = 170,
         value_range: Optional[Tuple[float, float]] = None,
+        colors: Optional[Sequence[str]] = None,
     ) -> None:
         clean_values = sorted(
             {float(value) for value in values if math.isfinite(float(value))}
@@ -501,6 +623,15 @@ class Tkinter3DCanvas(tk.Frame):
             if maximum < minimum:
                 minimum, maximum = maximum, minimum
 
+        legend_colors: List[str] = []
+        if colors is not None and len(colors) == len(values):
+            by_value = {
+                float(value): str(color)
+                for value, color in zip(values, colors)
+                if math.isfinite(float(value))
+            }
+            legend_colors = [by_value[value] for value in clean_values]
+
         self._thickness_legend = {
             "values": clean_values,
             "minimum": minimum,
@@ -508,6 +639,7 @@ class Tkinter3DCanvas(tk.Frame):
             "unit": str(unit),
             "title": str(title),
             "width": max(130, int(width)),
+            "colors": legend_colors,
         }
         self._invalidate_geometry_cache()
         self._request_redraw()
@@ -549,6 +681,25 @@ class Tkinter3DCanvas(tk.Frame):
         else:
             minimum = maximum = float(thickness)
         return _interpolate_thickness_color(float(thickness), minimum, maximum)
+
+    @staticmethod
+    def _legend_color(legend: Dict[str, Any], value: float) -> str:
+        levels = list(legend.get("values", ()))
+        colors = list(legend.get("colors", ()))
+        if len(levels) < 2 or len(colors) != len(levels):
+            return _interpolate_thickness_color(
+                value, float(legend["minimum"]), float(legend["maximum"])
+            )
+        if value <= levels[0]:
+            return colors[0]
+        for index in range(1, len(levels)):
+            if value <= levels[index]:
+                low, high = float(levels[index - 1]), float(levels[index])
+                fraction = 0.0 if high <= low else (value - low) / (high - low)
+                first = np.asarray(_hex_to_rgb(colors[index - 1]), dtype=float)
+                second = np.asarray(_hex_to_rgb(colors[index]), dtype=float)
+                return _rgb_to_hex(*(first + fraction * (second - first)))
+        return colors[-1]
 
     @staticmethod
     def _format_legend_value(value: float) -> str:
@@ -642,7 +793,7 @@ class Tkinter3DCanvas(tk.Frame):
             swatch_width = 34
             y_coord = bar_top
             for value in values:
-                color = _interpolate_thickness_color(value, minimum, maximum)
+                color = self._legend_color(legend, value)
                 self.canvas.create_rectangle(
                     left + padding,
                     y_coord,
@@ -673,7 +824,7 @@ class Tkinter3DCanvas(tk.Frame):
             fraction_0 = index / steps
             fraction_1 = (index + 1) / steps
             value = maximum - fraction_0 * (maximum - minimum)
-            color = _interpolate_thickness_color(value, minimum, maximum)
+            color = self._legend_color(legend, value)
             y_0 = bar_top + fraction_0 * (bar_bottom - bar_top)
             y_1 = bar_top + fraction_1 * (bar_bottom - bar_top) + 1
             self.canvas.create_rectangle(
@@ -731,6 +882,7 @@ class Tkinter3DCanvas(tk.Frame):
                 legend.get("minimum"),
                 legend.get("maximum"),
                 tuple(legend.get("values", ())),
+                tuple(legend.get("colors", ())),
                 legend.get("width"),
                 self.width,
                 self.height,
@@ -837,10 +989,19 @@ class Tkinter3DCanvas(tk.Frame):
         """
         if event.widget is not self:
             return
+        binding = getattr(self, "_selection_release_binding", None)
+        toplevel = getattr(self, "_selection_release_toplevel", None)
+        if binding and toplevel is not None:
+            try:
+                toplevel.unbind("<ButtonRelease-1>", binding)
+            except tk.TclError:
+                pass
+            self._selection_release_binding = None
         for attribute in (
             "_redraw_after_id",
             "_finish_interaction_after_id",
             "_animation_after_id",
+            "_hover_after_id",
         ):
             handle = getattr(self, attribute, None)
             if handle is None:
@@ -859,11 +1020,194 @@ class Tkinter3DCanvas(tk.Frame):
             return
         self.width = new_width
         self.height = new_height
+        self._selection_index = None
+        self._selection_index_key = None
+        self._reset_selection_cycle()
         self._request_redraw()
 
     # ------------------------------------------------------------------
     # picking, hover and highlight
     # ------------------------------------------------------------------
+    @property
+    def interaction_profile(self) -> str:
+        return self._interaction_profile
+
+    def set_interaction_profile(self, profile: str) -> None:
+        """Choose ``legacy`` or commercial CAD-style mouse interaction.
+
+        ``legacy`` preserves the original LMB-pan/RMB-orbit bindings.
+        ``commercial`` reserves LMB for selection, moves pan to MMB and keeps
+        orbit on RMB.  Changing profile does not enable callbacks by itself.
+        """
+
+        profile = str(profile).strip().lower()
+        if profile not in {"legacy", "commercial"}:
+            raise ValueError("interaction profile must be 'legacy' or 'commercial'")
+        if profile == self._interaction_profile:
+            return
+        self._cancel_selection_gesture()
+        for sequence, identifier in self._interaction_bindings:
+            self.canvas.unbind(sequence, identifier)
+        self._interaction_bindings.clear()
+
+        def bind(sequence: str, callback: Any) -> None:
+            identifier = self.canvas.bind(sequence, callback, add="+")
+            if identifier:
+                self._interaction_bindings.append((sequence, identifier))
+
+        self._interaction_profile = profile
+        if profile == "legacy":
+            bind(
+                "<ButtonPress-1>",
+                lambda event: self._on_mouse_down(event, "pan"),
+            )
+            bind("<B1-Motion>", self._on_mouse_drag)
+            bind("<ButtonRelease-1>", self._on_mouse_up)
+            bind("<ButtonPress-1>", self._on_pick_press)
+            bind("<ButtonRelease-1>", self._on_pick_release)
+            bind("<Motion>", self._on_pick_motion)
+        else:
+            bind("<ButtonPress-1>", self._on_selection_press)
+            bind("<B1-Motion>", self._on_selection_drag)
+            bind("<ButtonRelease-1>", self._on_selection_release)
+            bind("<Motion>", self._on_selection_hover_motion)
+            bind(
+                "<ButtonPress-2>",
+                lambda event: self._on_mouse_down(event, "pan"),
+            )
+            bind("<B2-Motion>", self._on_mouse_drag)
+            bind("<ButtonRelease-2>", self._on_mouse_up)
+        bind(
+            "<ButtonPress-3>",
+            lambda event: self._on_mouse_down(event, "rotate"),
+        )
+        bind("<B3-Motion>", self._on_mouse_drag)
+        bind("<ButtonRelease-3>", self._on_mouse_up)
+
+    def configure_selection(
+        self,
+        callback: Optional[Callable[[SelectionEvent], None]],
+        *,
+        hover_callback: Optional[Callable[[Optional[SelectionHit]], None]] = None,
+        config: Optional[SelectionConfig] = None,
+    ) -> None:
+        """Configure rich click/drag selection callbacks.
+
+        Region gestures are delivered only by the commercial interaction
+        profile.  Programmatic point and rectangle queries work in either
+        profile.
+        """
+
+        self._selection_callback = callback
+        self._selection_hover_callback = hover_callback
+        if config is not None:
+            if not isinstance(config, SelectionConfig):
+                raise TypeError("config must be a SelectionConfig")
+            self._selection_config = config
+        self._reset_selection_cycle()
+
+    @property
+    def selection_config(self) -> SelectionConfig:
+        return self._selection_config
+
+    def update_selection_config(self, **changes: Any) -> SelectionConfig:
+        """Replace selected fields of the immutable selection configuration."""
+
+        self._selection_config = replace(self._selection_config, **changes)
+        self._reset_selection_cycle()
+        self.set_preselection(None)
+        return self._selection_config
+
+    def query_point(
+        self,
+        x: int,
+        y: int,
+        *,
+        selection_filter: Optional[SelectionFilter] = None,
+        radius: Optional[int] = None,
+    ) -> Tuple[SelectionHit, ...]:
+        """Return the front-to-back semantic candidate stack at a pixel."""
+
+        config = self._selection_config
+        return self._get_selection_index().point_hits(
+            int(x),
+            int(y),
+            selection_filter or config.filter,
+            radius=config.click_radius_px if radius is None else max(0, int(radius)),
+        )
+
+    def query_rectangle(
+        self,
+        start: Tuple[int, int],
+        end: Tuple[int, int],
+        *,
+        crossing: Optional[bool] = None,
+        selection_filter: Optional[SelectionFilter] = None,
+        depth: Optional[SelectionDepth] = None,
+    ) -> Tuple[SelectionHit, ...]:
+        """Query a directional window/crossing rectangle."""
+
+        config = self._selection_config
+        if crossing is None:
+            crossing = bool(config.directional and end[0] < start[0])
+        return self._get_selection_index().rectangle_hits(
+            (start[0], start[1], end[0], end[1]),
+            selection_filter or config.filter,
+            crossing=bool(crossing),
+            depth=SelectionDepth(config.depth if depth is None else depth),
+        )
+
+    def query_lasso(
+        self,
+        points: Sequence[Tuple[int, int]],
+        *,
+        selection_filter: Optional[SelectionFilter] = None,
+        depth: Optional[SelectionDepth] = None,
+    ) -> Tuple[SelectionHit, ...]:
+        """Query a freehand crossing polygon."""
+
+        config = self._selection_config
+        return self._get_selection_index().polygon_hits(
+            points,
+            selection_filter or config.filter,
+            depth=SelectionDepth(config.depth if depth is None else depth),
+        )
+
+    def screen_ray(self, x: float, y: float) -> Tuple[Point3D, Point3D]:
+        """World-space camera ray through a canvas pixel."""
+
+        self.width, self.height = self._viewport_size()
+        return self.camera.screen_ray(x, y, self._plot_width(), self.height)
+
+    def unproject_to_plane(
+        self,
+        x: float,
+        y: float,
+        plane_point: Any,
+        plane_normal: Any,
+    ) -> Optional[Point3D]:
+        """Map a canvas pixel onto a world plane, or return ``None``."""
+
+        self.width, self.height = self._viewport_size()
+        return self.camera.unproject_to_plane(
+            x,
+            y,
+            self._plot_width(),
+            self.height,
+            as_point(plane_point),
+            as_point(plane_normal),
+        )
+
+    def set_preselection(self, key: Optional[str]) -> None:
+        """Show one transient hover highlight, separate from selection."""
+
+        if self._pick.set_preselection(key):
+            self._request_redraw()
+
+    @property
+    def preselected_key(self) -> Optional[str]:
+        return self._pick.preselection_key
+
     def set_pick_callback(
         self,
         callback: Optional[Any],
@@ -989,7 +1333,548 @@ class Tkinter3DCanvas(tk.Frame):
             else Pick(tag=tag, item=-1 if item is None else int(item), x=x, y=y)
         )
 
+    def _on_modifier_key(self, event: tk.Event) -> None:
+        keysym = str(getattr(event, "keysym", "")).lower()
+        pressed = str(getattr(event, "type", "")) in {"2", "KeyPress"}
+        if keysym.startswith("shift"):
+            self._tracked_modifiers["shift"] = pressed
+        elif keysym.startswith("control"):
+            self._tracked_modifiers["ctrl"] = pressed
+        elif keysym.startswith("alt") or keysym.startswith("option") or keysym.startswith("meta"):
+            self._tracked_modifiers["alt"] = pressed
+
+    def _event_modifiers(self, event: tk.Event) -> Tuple[bool, bool, bool]:
+        shift, ctrl, alt = modifiers_from_event(event)
+        state = int(getattr(event, "state", 0) or 0)
+        if sys.platform == "win32":
+            # The low X11 Mod1 bit (0x0008) is present on ordinary native
+            # Windows button events in Tk 8.6; it does *not* mean Alt there.
+            # Windows reports Alt through its high 0x20000 bit.  Confirm that
+            # bit against the physical key because native menus can leave the
+            # event bit stale.  Misreading either case makes every plain click
+            # REMOVE, which looks exactly like selection is dead while hover
+            # continues to work.
+            alt = bool(state & 0x20000) and self._windows_alt_is_down()
+        # Windows and X11 put the current modifiers directly in mouse-event
+        # state (Windows Alt is 0x20000).  Merging key events here can leave
+        # Alt permanently active when the native menu consumes KeyRelease;
+        # every later click/box then becomes REMOVE and an empty selection
+        # appears completely broken while hover still works.  macOS Option is
+        # the platform that needs the separately tracked fallback.
+        tracked = self._tracked_modifiers if sys.platform == "darwin" else {}
+        return (
+            shift or bool(tracked.get("shift", False)),
+            ctrl or bool(tracked.get("ctrl", False)),
+            alt or bool(tracked.get("alt", False)),
+        )
+
+    @staticmethod
+    def _windows_alt_is_down() -> bool:
+        """Return the physical Windows Alt state, conservatively on failure."""
+
+        try:
+            import ctypes
+
+            return bool(ctypes.windll.user32.GetKeyState(0x12) & 0x8000)
+        except (AttributeError, OSError):  # pragma: no cover - unusual runtime
+            return True
+
+    def _on_selection_press(self, event: tk.Event) -> None:
+        # Recover cleanly if the platform dropped the preceding release.
+        if self._selection_press is not None:
+            self._finish_selection_gesture()
+        self.canvas.focus_set()
+        try:
+            self.canvas.grab_set()
+        except tk.TclError:
+            # A containing dialog may already own a local grab.  Selection is
+            # still usable inside the viewport; only release-outside capture
+            # is unavailable in that unusual case.
+            pass
+        self._selection_press = (int(event.x), int(event.y))
+        self._selection_modifiers = self._event_modifiers(event)
+        self._selection_dragging = False
+        self._selection_points = [self._selection_press]
+        self.set_preselection(None)
+        if self._selection_config.click_on_press:
+            operation = operation_from_modifiers(*self._selection_modifiers)
+            active = self._emit_click_selection(self._selection_press, operation)
+            self._selection_committed_on_press = True
+            self._selection_press_hit_keys = frozenset(hit.key for hit in active)
+
+    def _on_selection_drag(self, event: tk.Event) -> None:
+        press = self._selection_press
+        if press is None:
+            return
+        point = (int(event.x), int(event.y))
+        config = self._selection_config
+        if config.tool == SelectionTool.SINGLE:
+            return
+        if not self._selection_dragging:
+            if math.hypot(point[0] - press[0], point[1] - press[1]) < config.drag_threshold_px:
+                return
+            self._selection_dragging = True
+        if config.tool == SelectionTool.LASSO:
+            previous = self._selection_points[-1]
+            if math.hypot(point[0] - previous[0], point[1] - previous[1]) >= 3.0:
+                self._selection_points.append(point)
+            coords = [coordinate for pair in self._selection_points for coordinate in pair]
+            if self._selection_overlay is None:
+                self._selection_overlay = self.canvas.create_line(
+                    *coords,
+                    fill="#2563eb",
+                    width=2,
+                    dash=(5, 3),
+                    tags=_TAG_SELECTION,
+                )
+            else:
+                self.canvas.coords(self._selection_overlay, *coords)
+            return
+
+        crossing = bool(config.directional and point[0] < press[0])
+        outline = "#16a34a" if crossing else "#2563eb"
+        fill = "#dcfce7" if crossing else "#dbeafe"
+        dash = (5, 3) if crossing else ()
+        if self._selection_overlay is None:
+            self._selection_overlay = self.canvas.create_rectangle(
+                press[0],
+                press[1],
+                point[0],
+                point[1],
+                outline=outline,
+                fill=fill,
+                stipple="gray25",
+                width=2,
+                dash=dash,
+                tags=_TAG_SELECTION,
+            )
+        else:
+            self.canvas.coords(
+                self._selection_overlay, press[0], press[1], point[0], point[1]
+            )
+            self.canvas.itemconfigure(
+                self._selection_overlay, outline=outline, fill=fill, dash=dash
+            )
+
+    def _on_selection_release(self, event: tk.Event) -> None:
+        press = self._selection_press
+        if press is None:
+            return
+        end = (int(event.x), int(event.y))
+        operation = operation_from_modifiers(*self._selection_modifiers)
+        if self._selection_dragging:
+            config = self._selection_config
+            if config.tool == SelectionTool.LASSO:
+                points = tuple(self._selection_points + [end])
+                hits = self.query_lasso(points)
+                if (
+                    operation == SelectionOperation.TOGGLE
+                    and self._selection_committed_on_press
+                    and self._selection_press_hit_keys
+                ):
+                    hits = tuple(
+                        hit
+                        for hit in hits
+                        if hit.key not in self._selection_press_hit_keys
+                    )
+                event_value = SelectionEvent(
+                    SelectionGesture.LASSO,
+                    operation,
+                    hits=hits,
+                    start=press,
+                    end=end,
+                    points=points,
+                )
+            else:
+                crossing = bool(config.directional and end[0] < press[0])
+                hits = self.query_rectangle(press, end, crossing=crossing)
+                if (
+                    operation == SelectionOperation.TOGGLE
+                    and self._selection_committed_on_press
+                    and self._selection_press_hit_keys
+                ):
+                    # The start hit was already toggled on button press.  A
+                    # region beginning on the same object must toggle it only
+                    # once while still toggling every other enclosed owner.
+                    hits = tuple(
+                        hit
+                        for hit in hits
+                        if hit.key not in self._selection_press_hit_keys
+                    )
+                event_value = SelectionEvent(
+                    SelectionGesture.CROSSING if crossing else SelectionGesture.WINDOW,
+                    operation,
+                    hits=hits,
+                    start=press,
+                    end=end,
+                )
+            self._emit_selection_event(event_value)
+            self._reset_selection_cycle()
+        elif not self._selection_committed_on_press:
+            self._emit_click_selection(end, operation)
+        self._finish_selection_gesture()
+
+    def _on_toplevel_selection_release(self, event: tk.Event) -> None:
+        """Commit an active gesture when Tk skips the canvas release bind."""
+
+        if self._selection_press is None:
+            return
+        try:
+            x = int(event.x_root) - int(self.canvas.winfo_rootx())
+            y = int(event.y_root) - int(self.canvas.winfo_rooty())
+        except (AttributeError, tk.TclError, TypeError, ValueError):
+            # Synthetic/custom Tk events may not expose usable root
+            # coordinates.  Their local coordinates are still the best safe
+            # fallback and match a release delivered directly to the canvas.
+            x, y = int(event.x), int(event.y)
+        event.x, event.y = x, y
+        self._on_selection_release(event)
+
+    def _emit_click_selection(
+        self, point: Tuple[int, int], operation: SelectionOperation
+    ) -> Tuple[SelectionHit, ...]:
+        candidates = self.query_point(*point)
+        now = time.monotonic()
+        config = self._selection_config
+        signature = (
+            tuple(hit.key for hit in candidates),
+            config.filter,
+            config.depth,
+            operation,
+            self._selection_index_key,
+        )
+        same_anchor = (
+            self._cycle_anchor is not None
+            and math.hypot(
+                point[0] - self._cycle_anchor[0], point[1] - self._cycle_anchor[1]
+            )
+            <= config.cycle_radius_px
+        )
+        same_cycle = (
+            candidates
+            and signature == self._cycle_signature
+            and same_anchor
+            and (now - self._cycle_time) * 1000.0 <= config.cycle_timeout_ms
+        )
+        self._cycle_index = (
+            (self._cycle_index + 1) % len(candidates) if same_cycle else (0 if candidates else -1)
+        )
+        self._cycle_signature = signature if candidates else None
+        self._cycle_anchor = point if candidates else None
+        self._cycle_time = now
+        active = () if self._cycle_index < 0 else (candidates[self._cycle_index],)
+        self._emit_selection_event(
+            SelectionEvent(
+                SelectionGesture.CLICK,
+                operation,
+                hits=active,
+                candidates=candidates,
+                start=point,
+                end=point,
+                cycle_index=max(0, self._cycle_index),
+                cycle_total=len(candidates),
+            )
+        )
+        return active
+
+    def _emit_selection_event(self, event: SelectionEvent) -> None:
+        if self._selection_callback is not None:
+            self._selection_callback(event)
+        callback = self._pick.pick_callback
+        if callback is not None and event.gesture == SelectionGesture.CLICK:
+            hit = event.hits[0] if event.hits else None
+            shift, ctrl, alt = self._selection_modifiers
+            callback(
+                Pick(
+                    tag="" if hit is None else hit.key,
+                    item=-1 if hit is None else hit.item,
+                    x=event.end[0],
+                    y=event.end[1],
+                    shift=shift,
+                    ctrl=ctrl,
+                    alt=alt,
+                )
+            )
+
+    def _on_selection_hover_motion(self, event: tk.Event) -> None:
+        if self._selection_press is not None:
+            # Some Tk/Windows configurations lose ButtonRelease while the
+            # pointer grab is active.  The first ordinary Motion after the
+            # physical release has no Button1 state; use it to finish a click
+            # or box that would otherwise remain stranded indefinitely.
+            if not (int(getattr(event, "state", 0) or 0) & 0x0100):
+                self._on_selection_release(event)
+            return
+        if self._is_dragging:
+            return
+        self._hover_position = (int(event.x), int(event.y))
+        if self._hover_after_id is None:
+            self._hover_after_id = self.after(33, self._run_selection_hover)
+
+    def _run_selection_hover(self) -> None:
+        self._hover_after_id = None
+        point = self._hover_position
+        if point is None or self._selection_press is not None or self._is_dragging:
+            return
+        candidates = self.query_point(*point)
+        hit = next((candidate for candidate in candidates if candidate.visible), None)
+        key = None if hit is None else hit.key
+        if key == self._hover_key:
+            return
+        self._hover_key = key
+        self.set_preselection(key)
+        if self._selection_hover_callback is not None:
+            self._selection_hover_callback(hit)
+        if self._pick.hover_callback is not None:
+            self._pick.hover_callback(
+                None
+                if hit is None
+                else Pick(hit.key, hit.item, point[0], point[1])
+            )
+
+    def _finish_selection_gesture(self) -> None:
+        self._selection_press = None
+        self._selection_dragging = False
+        self._selection_points = []
+        self._selection_committed_on_press = False
+        self._selection_press_hit_keys = frozenset()
+        if self._selection_overlay is not None:
+            try:
+                self.canvas.delete(self._selection_overlay)
+            except tk.TclError:
+                pass
+            self._selection_overlay = None
+        try:
+            if self.canvas.grab_current() is self.canvas:
+                self.canvas.grab_release()
+        except tk.TclError:
+            pass
+
+    def _cancel_selection_gesture(self, _event: Optional[tk.Event] = None) -> None:
+        self._finish_selection_gesture()
+
+    def _on_selection_focus_out(self, _event: tk.Event) -> None:
+        for key in self._tracked_modifiers:
+            self._tracked_modifiers[key] = False
+        self._cancel_selection_gesture()
+
+    def _reset_selection_cycle(self) -> None:
+        self._cycle_signature = None
+        self._cycle_anchor = None
+        self._cycle_index = -1
+        self._cycle_time = 0.0
+
+    def _selection_view_key(self, scene: _CompiledScene) -> Tuple[Any, ...]:
+        camera = self.camera
+        return (
+            id(scene),
+            self.width,
+            self.height,
+            self._plot_width(),
+            camera.position.x,
+            camera.position.y,
+            camera.position.z,
+            camera.target.x,
+            camera.target.y,
+            camera.target.z,
+            camera.fov,
+            camera.near,
+            camera.far,
+        )
+
+    def _get_selection_index(self) -> ProjectedSelectionIndex:
+        """Return projected full-detail selection geometry for this view."""
+
+        self.width, self.height = self._viewport_size()
+        scene = self._get_scene("full")
+        key = self._selection_view_key(scene)
+        if self._selection_index is not None and self._selection_index_key == key:
+            return self._selection_index
+
+        right, camera_up, forward = self.camera.basis()
+        position = self.camera.position
+        origin = np.array([position.x, position.y, position.z], dtype=np.float32)
+        basis = np.array(
+            [
+                [right.x, camera_up.x, forward.x],
+                [right.y, camera_up.y, forward.y],
+                [right.z, camera_up.z, forward.z],
+            ],
+            dtype=np.float32,
+        )
+        y_scale = 1.0 / math.tan(self.camera.fov / 2.0)
+        plot_width = self._plot_width()
+        x_scale = y_scale * self.height / plot_width
+        half_width = 0.5 * plot_width
+        half_height = 0.5 * self.height
+        near = max(1.0e-9, float(self.camera.near))
+        projected: List[ProjectedPrimitive] = []
+        primitive_id = 0
+
+        def screen_points(
+            values: Sequence[Sequence[float]],
+        ) -> Tuple[Tuple[Tuple[float, float], ...], Tuple[float, ...]]:
+            points: List[Tuple[float, float]] = []
+            depths: List[float] = []
+            for camera_x, camera_y, camera_depth in values:
+                depth_value = max(float(camera_depth), near)
+                points.append(
+                    (
+                        (float(camera_x) * x_scale / depth_value + 1.0) * half_width,
+                        (1.0 - float(camera_y) * y_scale / depth_value) * half_height,
+                    )
+                )
+                depths.append(depth_value)
+            return tuple(points), tuple(depths)
+
+        def clipped_segment(
+            first: Sequence[float], second: Sequence[float]
+        ) -> Optional[Tuple[Tuple[float, float, float], Tuple[float, float, float]]]:
+            a = tuple(float(value) for value in first)
+            b = tuple(float(value) for value in second)
+            a_in = a[2] >= near
+            b_in = b[2] >= near
+            if not a_in and not b_in:
+                return None
+            if a_in and b_in:
+                return a, b
+            span = b[2] - a[2]
+            if abs(span) <= _EPS:
+                return None
+            parameter = (near - a[2]) / span
+            intersection = (
+                a[0] + parameter * (b[0] - a[0]),
+                a[1] + parameter * (b[1] - a[1]),
+                near,
+            )
+            return (a, intersection) if a_in else (intersection, b)
+
+        camera_space, _screen_x, _screen_y, valid = self._project(
+            scene.face_vertices,
+            origin,
+            basis,
+            x_scale,
+            y_scale,
+            half_width,
+            half_height,
+            near,
+        )
+        for face in range(scene.face_total):
+            start = int(scene.face_start[face])
+            stop = start + int(scene.face_count[face])
+            if stop <= start:
+                continue
+            if bool(scene.face_is_edge[face]):
+                clipped_line = clipped_segment(
+                    camera_space[start], camera_space[min(start + 1, stop - 1)]
+                )
+                if clipped_line is None:
+                    continue
+                points_2d, depths = screen_points(clipped_line)
+                shape = "segment"
+                radius = max(1.5, 0.5 * float(scene.face_width[face]))
+            else:
+                camera_polygon = camera_space[start:stop]
+                if bool(np.all(valid[start:stop])):
+                    clipped_polygon = [tuple(float(value) for value in row) for row in camera_polygon]
+                elif bool(np.any(valid[start:stop])):
+                    clipped_polygon = self._clip_near_plane(camera_polygon, near)
+                else:
+                    continue
+                if len(clipped_polygon) < 3:
+                    continue
+                points_2d, depths = screen_points(clipped_polygon)
+                shape = "polygon"
+                radius = 0.0
+            projected.append(
+                ProjectedPrimitive(
+                    index=primitive_id,
+                    shape=shape,
+                    points=points_2d,
+                    depths=depths,
+                    binding=(
+                        scene.face_bindings[face]
+                        if face < len(scene.face_bindings)
+                        else fallback_binding(scene.tags[face])
+                    ),
+                    layer=float(scene.face_layer[face]),
+                    radius=radius,
+                )
+            )
+            primitive_id += 1
+
+        if len(scene.line_vertices):
+            line_camera, _line_x, _line_y, _line_valid = self._project(
+                scene.line_vertices,
+                origin,
+                basis,
+                x_scale,
+                y_scale,
+                half_width,
+                half_height,
+                near,
+            )
+            for line in range(len(scene.line_vertices) // 2):
+                start = 2 * line
+                clipped_line = clipped_segment(
+                    line_camera[start], line_camera[start + 1]
+                )
+                if clipped_line is None:
+                    continue
+                points_2d, depths = screen_points(clipped_line)
+                projected.append(
+                    ProjectedPrimitive(
+                        index=primitive_id,
+                        shape="segment",
+                        points=points_2d,
+                        depths=depths,
+                        binding=(
+                            scene.line_bindings[line]
+                            if line < len(scene.line_bindings)
+                            else fallback_binding(scene.line_tags[line])
+                        ),
+                        layer=float(scene.line_layer[line]),
+                        radius=max(1.5, 0.5 * float(scene.line_width[line])),
+                    )
+                )
+                primitive_id += 1
+
+        if len(scene.marker_points):
+            marker_camera, marker_x, marker_y, marker_valid = self._project(
+                scene.marker_points,
+                origin,
+                basis,
+                x_scale,
+                y_scale,
+                half_width,
+                half_height,
+                near,
+            )
+            for marker in range(len(scene.marker_points)):
+                if not bool(marker_valid[marker]):
+                    continue
+                projected.append(
+                    ProjectedPrimitive(
+                        index=primitive_id,
+                        shape="point",
+                        points=((float(marker_x[marker]), float(marker_y[marker])),),
+                        depths=(float(marker_camera[marker, 2]),),
+                        binding=scene.marker_bindings[marker],
+                        layer=float(scene.marker_layers[marker]),
+                        radius=0.5 * float(scene.marker_sizes[marker]),
+                    )
+                )
+                primitive_id += 1
+
+        self._selection_index = ProjectedSelectionIndex(
+            projected, self.width, self.height
+        )
+        self._selection_index_key = key
+        return self._selection_index
+
     def _on_mouse_down(self, event: tk.Event, mode: str) -> None:
+        self._hover_key = None
+        self.set_preselection(None)
         self._last_mouse_x = int(event.x)
         self._last_mouse_y = int(event.y)
         self._is_dragging = True
@@ -1204,6 +2089,13 @@ class Tkinter3DCanvas(tk.Frame):
         self._world_primitive_cache.clear()
         self._scene_cache.clear()
         self._quality_lod_flag = None
+        self._selection_index = None
+        self._selection_index_key = None
+        pick = getattr(self, "_pick", None)
+        if pick is not None:
+            pick.invalidate()
+        if hasattr(self, "_cycle_signature"):
+            self._reset_selection_cycle()
 
     def _clear_canvas_only(self) -> None:
         self.canvas.delete("all")
@@ -1212,12 +2104,18 @@ class Tkinter3DCanvas(tk.Frame):
         self._polygon_state.clear()
         self._line_pool.clear()
         self._line_state.clear()
+        self._marker_pool.clear()
+        self._marker_state.clear()
         self._text_pool.clear()
         self._text_state.clear()
 
     def clear(self, keep_canvas: bool = False) -> None:
         self.objects.clear()
         self._explicit_opaque_cylinder_occluders.clear()
+        if hasattr(self, "_hover_key"):
+            self._hover_key = None
+        if hasattr(self, "_pick"):
+            self._pick.set_preselection(None)
         self._invalidate_geometry_cache()
         if not keep_canvas:
             self._clear_canvas_only()
@@ -1446,6 +2344,8 @@ class Tkinter3DCanvas(tk.Frame):
 
         line_vertices: List[Tuple[float, float, float]] = []
         line_layer: List[float] = []
+        marker_points: List[Tuple[float, float, float]] = []
+        marker_layer: List[float] = []
         text_points: List[Tuple[float, float, float]] = []
         text_layer: List[float] = []
 
@@ -1453,6 +2353,31 @@ class Tkinter3DCanvas(tk.Frame):
 
         for primitive in primitives:
             kind = primitive.get("kind")
+
+            if kind == "markers":
+                points = primitive.get("points", ())
+                marker_points.extend(
+                    (float(point[0]), float(point[1]), float(point[2]))
+                    if not isinstance(point, Point3D)
+                    else (point.x, point.y, point.z)
+                    for point in points
+                )
+                total = len(points)
+                scene.marker_colors.extend(primitive.get("colors", ["#2563eb"] * total))
+                scene.marker_outlines.extend(
+                    primitive.get("outlines", [""] * total)
+                )
+                scene.marker_sizes.extend(primitive.get("sizes", [5] * total))
+                marker_layer.extend([float(primitive.get("layer", 32))] * total)
+                tags = primitive.get("tags") or ""
+                scene.marker_tags.extend([tags] * total)
+                scene.marker_bindings.extend(
+                    primitive.get("bindings")
+                    or _coerce_pick_bindings(None, total, tags)
+                )
+                if tags:
+                    scene.any_tags = True
+                continue
 
             if kind == "faces":
                 flush_pending()
@@ -1492,6 +2417,10 @@ class Tkinter3DCanvas(tk.Frame):
                 scene.face_width.extend([primitive.get("width", 1)] * total)
                 tags = primitive.get("tags") or ""
                 scene.tags.extend([tags] * total)
+                scene.face_bindings.extend(
+                    primitive.get("bindings")
+                    or _coerce_pick_bindings(None, total, tags)
+                )
                 if tags:
                     scene.any_tags = True
 
@@ -1528,6 +2457,9 @@ class Tkinter3DCanvas(tk.Frame):
                     scene.line_width.append(width)
                     overlay_tags = primitive.get("tags") or ""
                     scene.line_tags.append(overlay_tags)
+                    scene.line_bindings.append(
+                        _coerce_pick_binding(primitive.get("binding"), overlay_tags)
+                    )
                     line_layer.append(layer)
                     continue
                 # Depth-sorted lines share the face pipeline: a four-point
@@ -1566,6 +2498,9 @@ class Tkinter3DCanvas(tk.Frame):
                 scene.face_width.append(width)
                 line_tags = primitive.get("tags") or ""
                 scene.tags.append(line_tags)
+                scene.face_bindings.append(
+                    _coerce_pick_binding(primitive.get("binding"), line_tags)
+                )
                 if line_tags:
                     scene.any_tags = True
                 continue
@@ -1599,6 +2534,9 @@ class Tkinter3DCanvas(tk.Frame):
             scene.face_width.append(primitive.get("width", 1))
             tags = primitive.get("tags") or ""
             scene.tags.append(tags)
+            scene.face_bindings.append(
+                _coerce_pick_binding(primitive.get("binding"), tags)
+            )
             if tags:
                 scene.any_tags = True
 
@@ -1647,6 +2585,16 @@ class Tkinter3DCanvas(tk.Frame):
             else np.empty((0, 3), dtype=np.float32)
         )
         scene.line_layer = np.asarray(line_layer, dtype=np.float32) if line_layer else np.empty(0, np.float32)
+        scene.marker_points = (
+            np.asarray(marker_points, dtype=np.float32)
+            if marker_points
+            else np.empty((0, 3), dtype=np.float32)
+        )
+        scene.marker_layers = (
+            np.asarray(marker_layer, dtype=np.float32)
+            if marker_layer
+            else np.empty(0, np.float32)
+        )
         scene.text_points = (
             np.asarray(text_points, dtype=np.float32)
             if text_points
@@ -1839,6 +2787,9 @@ class Tkinter3DCanvas(tk.Frame):
             )
             self._draw_faces(scene, order, front, coords, clipped, interactive)
         self._draw_overlay_lines(
+            scene, origin, basis, x_scale, y_scale, half_width, half_height, near
+        )
+        self._draw_markers(
             scene, origin, basis, x_scale, y_scale, half_width, half_height, near
         )
         self._draw_texts(
@@ -2066,6 +3017,7 @@ class Tkinter3DCanvas(tk.Frame):
         # Resolved once per scene and highlight generation, so orbiting a
         # highlighted model does not re-split every tag string every frame.
         highlighted = self._pick.highlighted_faces(scene)
+        preselected = self._pick.preselected_faces(scene)
         highlight_fill = self._pick.highlight_fill
         highlight_outline = self._pick.highlight_outline
 
@@ -2099,10 +3051,15 @@ class Tkinter3DCanvas(tk.Frame):
                 outline = outlines[face]
 
             if highlighted is not None and face in highlighted:
-                fill = highlight_fill
+                if not is_edge[face]:
+                    fill = highlight_fill
                 # Always stroke a highlighted face, even when mesh lines are
                 # off, so the selection reads against its neighbours.
                 outline = highlight_outline
+            elif preselected is not None and face in preselected:
+                if not is_edge[face]:
+                    fill = self._pick.preselection_fill
+                outline = self._pick.preselection_outline
 
             state = (fill, outline, widths[face], stipple, tags[face])
             if states[slot] != state:
@@ -2172,18 +3129,37 @@ class Tkinter3DCanvas(tk.Frame):
         colors = scene.line_color
         widths = scene.line_width
         line_tags = scene.line_tags
+        line_bindings = scene.line_bindings
         any_line_tags = any(line_tags)
+        selected = self._pick.highlight_tags
+        preselected = self._pick.preselection_key
 
         for slot, line in enumerate(index.tolist()):
             item = pool[slot]
             call((widget, "coords", item, round(float(x0[line])), round(float(y0[line])),
                   round(float(x1[line])), round(float(y1[line]))))
             tag = line_tags[line] if any_line_tags else ""
-            state = (colors[line], widths[line], tag)
+            binding = line_bindings[line] if line < len(line_bindings) else None
+            keys = () if binding is None else tuple(owner.key for owner in binding.owners)
+            is_selected = bool(selected.intersection(keys)) or tag in selected
+            is_preselected = bool(
+                preselected
+                and not is_selected
+                and (preselected in keys or preselected in tag.split())
+            )
+            color = (
+                self._pick.highlight_outline
+                if is_selected
+                else self._pick.preselection_outline
+                if is_preselected
+                else colors[line]
+            )
+            width = widths[line] + (2 if (is_selected or is_preselected) else 0)
+            state = (color, width, tag)
             if states[slot] != state:
                 options = (
-                    "-fill", colors[line],
-                    "-width", widths[line],
+                    "-fill", color,
+                    "-width", width,
                     "-state", "normal",
                 )
                 if any_line_tags:
@@ -2192,6 +3168,94 @@ class Tkinter3DCanvas(tk.Frame):
                 states[slot] = state
 
         self._hide_unused(self._line_pool, self._line_state, needed)
+
+    def _draw_markers(
+        self,
+        scene: _CompiledScene,
+        origin: np.ndarray,
+        basis: np.ndarray,
+        x_scale: float,
+        y_scale: float,
+        half_width: float,
+        half_height: float,
+        near: float,
+    ) -> None:
+        total = len(scene.marker_points)
+        if total == 0:
+            self._hide_unused(self._marker_pool, self._marker_state, 0)
+            return
+        camera_space, screen_x, screen_y, valid = self._project(
+            scene.marker_points,
+            origin,
+            basis,
+            x_scale,
+            y_scale,
+            half_width,
+            half_height,
+            near,
+        )
+        margin = 12.0
+        visible = (
+            valid
+            & (screen_x >= -margin)
+            & (screen_x <= self._plot_width() + margin)
+            & (screen_y >= -margin)
+            & (screen_y <= self.height + margin)
+        )
+        index = np.nonzero(visible)[0]
+        if len(index) == 0:
+            self._hide_unused(self._marker_pool, self._marker_state, 0)
+            return
+        index = index[np.argsort(-camera_space[index, 2], kind="stable")]
+        self._ensure_pool(
+            self._marker_pool,
+            self._marker_state,
+            len(index),
+            lambda: self.canvas.create_oval(
+                0, 0, 0, 0, state="hidden", tags=_TAG_MARKER
+            ),
+        )
+        selected = self._pick.highlight_tags
+        preselected = self._pick.preselection_key
+        for slot, marker in enumerate(index.tolist()):
+            binding = scene.marker_bindings[marker]
+            keys = () if binding is None else tuple(owner.key for owner in binding.owners)
+            is_selected = bool(selected.intersection(keys))
+            is_preselected = bool(preselected and preselected in keys and not is_selected)
+            size = scene.marker_sizes[marker] + (2 if is_preselected else 0)
+            radius = 0.5 * size
+            x = float(screen_x[marker])
+            y = float(screen_y[marker])
+            self.canvas.coords(
+                self._marker_pool[slot], x - radius, y - radius, x + radius, y + radius
+            )
+            fill = (
+                self._pick.highlight_fill
+                if is_selected
+                else self._pick.preselection_fill
+                if is_preselected
+                else scene.marker_colors[marker]
+            )
+            outline = (
+                self._pick.highlight_outline
+                if is_selected
+                else self._pick.preselection_outline
+                if is_preselected
+                else scene.marker_outlines[marker]
+            )
+            tag = scene.marker_tags[marker]
+            state = (fill, outline, size, tag)
+            if self._marker_state[slot] != state:
+                self.canvas.itemconfigure(
+                    self._marker_pool[slot],
+                    fill=fill,
+                    outline=outline,
+                    width=2 if (is_selected or is_preselected) else 1,
+                    state="normal",
+                    tags=(_TAG_MARKER + " " + tag).strip(),
+                )
+                self._marker_state[slot] = state
+        self._hide_unused(self._marker_pool, self._marker_state, len(index))
 
     def _draw_texts(
         self,
@@ -2284,7 +3348,7 @@ class Tkinter3DCanvas(tk.Frame):
         if restack:
             # New face items are created on top; lines, texts and the HUD must
             # stay above them.
-            for tag in (_TAG_LINE, _TAG_TEXT, _TAG_HUD):
+            for tag in (_TAG_LINE, _TAG_MARKER, _TAG_TEXT, _TAG_HUD, _TAG_SELECTION):
                 try:
                     self.canvas.tag_raise(tag)
                 except tk.TclError:
@@ -2354,6 +3418,7 @@ class Tkinter3DCanvas(tk.Frame):
         lit: bool = True,
         stipple_phase: int = 0,
         opacity: Optional[float] = None,
+        binding: Optional[PickBinding] = None,
     ) -> Optional[Dict[str, Any]]:
         vertices_list = vertices if type(vertices) is list else list(vertices)
         count = len(vertices_list)
@@ -2386,6 +3451,7 @@ class Tkinter3DCanvas(tk.Frame):
             "tags": tags,
             "two_sided_shell": bool(two_sided_shell),
             "lit": bool(lit),
+            "binding": binding,
         }
 
     @staticmethod
@@ -2397,6 +3463,7 @@ class Tkinter3DCanvas(tk.Frame):
         layer: int = 30,
         draw_overlay: bool = False,
         tags: str = "",
+        binding: Optional[PickBinding] = None,
     ) -> Dict[str, Any]:
         return {
             "kind": "line",
@@ -2407,6 +3474,7 @@ class Tkinter3DCanvas(tk.Frame):
             "layer": layer,
             "draw_overlay": bool(draw_overlay),
             "tags": tags,
+            "binding": binding,
         }
 
     def _object_to_primitives(
@@ -2426,6 +3494,7 @@ class Tkinter3DCanvas(tk.Frame):
                     layer=int(obj.get("layer", 30)),
                     draw_overlay=bool(obj.get("draw_overlay", False)),
                     tags=obj.get("tags", ""),
+                    binding=obj.get("binding"),
                 )
             ]
         if object_type == "text":
@@ -2456,10 +3525,13 @@ class Tkinter3DCanvas(tk.Frame):
                 lit=bool(obj.get("lit", True)),
                 stipple_phase=object_index,
                 opacity=obj.get("opacity"),
+                binding=obj.get("binding"),
             )
             return [primitive] if primitive else []
         if object_type == "faces":
             return [dict(obj, kind="faces", stipple_phase=object_index)]
+        if object_type == "markers":
+            return [dict(obj, kind="markers")]
         if object_type == "mesh":
             return self._mesh_primitives(obj, object_index)
         if object_type == "cylinder":
@@ -2487,6 +3559,7 @@ class Tkinter3DCanvas(tk.Frame):
         opacity = obj.get("opacity")
         back_color = obj.get("back_color", "")
         tags = obj.get("tags", "")
+        bindings = obj.get("bindings")
         lit = bool(obj.get("lit", True))
         two_sided = bool(obj.get("two_sided_shell", False))
 
@@ -2510,6 +3583,7 @@ class Tkinter3DCanvas(tk.Frame):
                 lit=lit,
                 stipple_phase=object_index,
                 opacity=opacity,
+                binding=(bindings[face_index] if bindings is not None else None),
             )
             if primitive:
                 primitives.append(primitive)
@@ -3262,6 +4336,7 @@ class Tkinter3DCanvas(tk.Frame):
         layer: int = 30,
         draw_overlay: bool = False,
         tags: str = "",
+        binding: Any = None,
     ) -> None:
         self._add_object(
             {
@@ -3273,6 +4348,7 @@ class Tkinter3DCanvas(tk.Frame):
                 "layer": int(layer),
                 "draw_overlay": bool(draw_overlay),
                 "tags": tags,
+                "binding": _coerce_pick_binding(binding, tags),
             }
         )
 
@@ -3313,6 +4389,7 @@ class Tkinter3DCanvas(tk.Frame):
         two_sided_shell: bool = False,
         opacity: Optional[float] = None,
         lit: bool = True,
+        binding: Any = None,
     ) -> None:
         self._add_object(
             {
@@ -3329,6 +4406,7 @@ class Tkinter3DCanvas(tk.Frame):
                 "tags": tags,
                 "two_sided_shell": two_sided_shell,
                 "lit": lit,
+                "binding": _coerce_pick_binding(binding, tags),
             }
         )
 
@@ -3346,6 +4424,7 @@ class Tkinter3DCanvas(tk.Frame):
         tags: str = "",
         lit: bool = True,
         two_sided_shell: bool = False,
+        bindings: Any = None,
     ) -> None:
         """
         Add many independent faces in one call, each with its own colour.
@@ -3387,6 +4466,8 @@ class Tkinter3DCanvas(tk.Frame):
         if stipple or opacity < stipple_module.OPAQUE_THRESHOLD:
             cull_backface = False
 
+        binding_list = _coerce_pick_bindings(bindings, total, tags)
+
         self._add_object(
             {
                 "type": "faces",
@@ -3403,6 +4484,58 @@ class Tkinter3DCanvas(tk.Frame):
                 "tags": tags,
                 "lit": bool(lit),
                 "two_sided_shell": bool(two_sided_shell),
+                "bindings": binding_list,
+            }
+        )
+
+    def add_markers(
+        self,
+        points: Iterable[Any],
+        colors: Any = "#2563eb",
+        size: Any = 6,
+        outline: Any = "",
+        layer: int = 32,
+        tags: str = "",
+        bindings: Any = None,
+    ) -> None:
+        """Add fixed-pixel point markers as one compiled batch.
+
+        Markers are intended for geometry points and mesh nodes.  Their
+        screen-space size remains usable while zooming, and their bindings
+        participate in point/window selection without one scene object per
+        node.
+        """
+
+        point_list = [as_point(point) for point in points]
+        total = len(point_list)
+        if total == 0:
+            return
+
+        def expanded(value: Any, name: str, transform: Callable[[Any], Any]) -> List[Any]:
+            if isinstance(value, str):
+                return [transform(value)] * total
+            try:
+                raw_values = list(value)
+            except TypeError:
+                return [transform(value)] * total
+            values = [transform(item) for item in raw_values]
+            if len(values) != total:
+                raise ValueError(f"{name} has {len(values)} entries for {total} markers")
+            return values
+
+        color_list = expanded(colors, "colors", str)
+        outline_list = expanded(outline, "outline", str)
+        size_list = expanded(size, "size", lambda value: max(1, int(value)))
+        self._add_object(
+            {
+                "type": "markers",
+                "points": point_list,
+                "colors": color_list,
+                "outlines": outline_list,
+                "sizes": size_list,
+                "layer": int(layer),
+                "tags": tags,
+                "bindings": _coerce_pick_bindings(bindings, total, tags),
             }
         )
 
@@ -3422,6 +4555,7 @@ class Tkinter3DCanvas(tk.Frame):
         lit: bool = True,
         face_colors: Optional[Sequence[str]] = None,
         two_sided_shell: bool = False,
+        bindings: Any = None,
     ) -> None:
         """
         Add an indexed triangle/polygon mesh.
@@ -3434,11 +4568,13 @@ class Tkinter3DCanvas(tk.Frame):
         if stipple or opacity < stipple_module.OPAQUE_THRESHOLD:
             # A see-through solid must keep its far side, or it looks cut open.
             cull_backface = False
+        face_list = [tuple(int(index) for index in face) for face in faces]
+        binding_list = _coerce_pick_bindings(bindings, len(face_list), tags)
         self._add_object(
             {
                 "type": "mesh",
                 "points": [as_point(vertex) for vertex in vertices],
-                "faces": [tuple(int(index) for index in face) for face in faces],
+                "faces": face_list,
                 "color": color,
                 "face_colors": list(face_colors) if face_colors is not None else None,
                 "outline": outline,
@@ -3451,6 +4587,7 @@ class Tkinter3DCanvas(tk.Frame):
                 "tags": tags,
                 "lit": bool(lit),
                 "two_sided_shell": bool(two_sided_shell),
+                "bindings": binding_list,
             }
         )
 
@@ -4107,6 +5244,14 @@ class Tkinter3DCanvas(tk.Frame):
                     high = vertices.max(axis=0)
                     points.append(Point3D(*low))
                     points.append(Point3D(*high))
+            elif object_type == "markers":
+                marker_points = obj.get("points", [])
+                if marker_points:
+                    xs = [point.x for point in marker_points]
+                    ys = [point.y for point in marker_points]
+                    zs = [point.z for point in marker_points]
+                    points.append(Point3D(min(xs), min(ys), min(zs)))
+                    points.append(Point3D(max(xs), max(ys), max(zs)))
             elif object_type == "cylinder":
                 center = obj.get("center", Point3D(0.0, 0.0, 0.0))
                 radius = max(
