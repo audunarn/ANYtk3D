@@ -4,34 +4,66 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ANYtk3D"
-version = "0.1.0"
-description = "Fast dependency-free 3D drawing on a Tkinter Canvas - stiffened plates, cylinders, thickness colour-coding and camera orbit without OpenGL or matplotlib"
+version = "0.2.2"
+description = "Fast dependency-free 3D drawing on a Tkinter Canvas - solids, meshes, lighting, layered transparency and depth-correct painter rendering without OpenGL or matplotlib"
 readme = "README.md"
 license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
 authors = [
     { name = "Audun Arnesen Nyhus", email = "audunarn@gmail.com" },
 ]
 requires-python = ">=3.10"
-keywords = ["tkinter", "3d", "canvas", "visualization", "stiffened panel", "cylinder"]
+keywords = [
+    "tkinter",
+    "3d",
+    "canvas",
+    "visualization",
+    "mesh",
+    "lighting",
+    "transparency",
+    "finite element",
+    "stiffened panel",
+    "cylinder",
+]
 classifiers = [
     "Development Status :: 4 - Beta",
+    "Environment :: MacOS X",
+    "Environment :: Win32 (MS Windows)",
+    "Environment :: X11 Applications",
+    "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Multimedia :: Graphics :: 3D Rendering",
+    "Topic :: Scientific/Engineering :: Visualization",
+    "Topic :: Software Development :: User Interfaces",
 ]
 dependencies = [
     "numpy",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "build"]
+dev = ["pytest", "build", "twine"]
+
+# Tkinter demo: a GUI entry point so no console window opens alongside it.
+[project.gui-scripts]
+anytk3d-demo = "anytk3d.demo:main"
 
 [project.urls]
 Homepage = "https://github.com/audunarn/ANYtk3D"
 Repository = "https://github.com/audunarn/ANYtk3D"
+Issues = "https://github.com/audunarn/ANYtk3D/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "native_gui: opt-in tests that drive a real interactive desktop with native input",
+]
