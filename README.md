@@ -171,6 +171,20 @@ removes. `query_point`, `query_rectangle`, `screen_ray`, and
 `unproject_to_plane` expose the same projected geometry for modelling tools.
 The default interaction profile remains `legacy` for compatibility.
 
+### Section planes
+
+World-space section planes clip faces, lines, markers, text and projected
+selection geometry without changing the retained scene. The normal is
+normalized and the half-space `normal · point >= offset` is retained; the cut
+surface is intentionally left open rather than capped.
+
+```python
+canvas.set_section_plane(normal=(1, 0, 0), offset=1.5)
+canvas.clear_section_plane()
+```
+
+The plane remains active during orbit, animation and fast interactive frames.
+
 ### Colour scale
 
 Plate colour-coding, the legend and `thickness_color` all share one scale.
@@ -270,20 +284,39 @@ original API (`Tkinter3DCanvas`, `Point3D`, `Camera3D` and every
 ## Development
 
 ```bash
+pip install -e ../ANY3dView
 pip install -e .[dev]
 pytest
 ```
 
-The regular suite uses deterministic Tk-generated events and never moves the
-desktop pointer. A small Windows-native acceptance suite covers event
-translation that synthetic Tk events cannot reproduce: hover/click and
-selection modifiers, directional window/crossing selection, plus middle-pan,
-right-orbit and wheel zoom. Run it only on an interactive Windows desktop:
+`ANY3dView` owns the backend-neutral geometry, camera, shading, clipping and
+selection types. ANYtk3D re-exports those objects, so existing 0.2 imports keep
+working unchanged.
+
+The regular suite stays headless. Tests that create real Tk windows are opt-in
+so a developer run cannot unexpectedly open GUI sessions:
 
 ```powershell
+$env:ANYTK3D_RUN_GUI_TESTS = "1"
+python -m pytest
+```
+
+Those tests use deterministic Tk-generated events and never move the desktop
+pointer. A smaller Windows-native acceptance suite covers event translation
+that synthetic Tk events cannot reproduce: hover/click and selection
+modifiers, directional window/crossing selection, plus middle-pan, right-orbit
+and wheel zoom. Run it only on an interactive Windows desktop:
+
+```powershell
+$env:ANYTK3D_RUN_GUI_TESTS = "1"
 $env:ANYTK3D_RUN_NATIVE_GUI = "1"
 python -m pytest tests/test_native_gui_acceptance.py -q
 ```
+
+Release qualification also reconstructs the package from Git-tracked files,
+builds a wheel, and imports it outside the checkout. This prevents a local,
+untracked runtime module from making source tests pass while a clean release
+fails to import.
 
 ## License
 

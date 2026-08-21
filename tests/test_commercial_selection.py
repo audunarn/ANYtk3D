@@ -225,6 +225,28 @@ def test_projected_index_is_reused_until_the_view_changes(canvas, root):
     assert canvas._get_selection_index() is not first
 
 
+def test_section_plane_removes_clipped_marker_from_projected_selection(canvas, root):
+    canvas.add_markers(
+        [Point3D(-1, 0, 0), Point3D(1, 0, 0)],
+        bindings=[
+            PickBinding.one("left", "mesh.node"),
+            PickBinding.one("right", "mesh.node"),
+        ],
+    )
+    canvas.fit_to_scene(redraw=False)
+    canvas.set_section_plane((1, 0, 0), 0)
+    root.update()
+
+    owners = {
+        owner.key
+        for primitive in canvas._get_selection_index().primitives
+        if primitive.binding is not None
+        for owner in primitive.binding.owners
+    }
+    assert "right" in owners
+    assert "left" not in owners
+
+
 def test_commercial_lmb_click_and_directional_drag_emit_events(canvas, root):
     populate_two_faces(canvas, root)
     seen = []

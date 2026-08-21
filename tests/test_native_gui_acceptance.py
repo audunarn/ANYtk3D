@@ -7,6 +7,7 @@ through Win32 mouse/key input while Tk's main loop is running.
 
 Run explicitly on an interactive Windows desktop with::
 
+    $env:ANYTK3D_RUN_GUI_TESTS = "1"
     $env:ANYTK3D_RUN_NATIVE_GUI = "1"
     python -m pytest tests/test_native_gui_acceptance.py -q
 

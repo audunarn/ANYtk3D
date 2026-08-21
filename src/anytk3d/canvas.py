@@ -57,6 +57,8 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 
 import numpy as np
 
+from any3dview.clipping import SectionPlane
+
 from . import shapes as shapes_module
 from . import stipple as stipple_module
 from .picking import (
@@ -123,6 +125,7 @@ __all__ = [
     "SelectionHit",
     "SelectionOperation",
     "SelectionTool",
+    "SectionPlane",
     "Tkinter3DCanvas",
     "create_stiffened_cylinder_demo",
     "get_color_stops",
@@ -381,6 +384,7 @@ class Tkinter3DCanvas(tk.Frame):
         self._light = Light()
         self._shading_enabled = bool(shading)
         self._occlude_lines = True
+        self._section_plane: Optional[SectionPlane] = None
 
         canvas_kwargs.setdefault("highlightthickness", 0)
         canvas_kwargs.setdefault("borderwidth", 0)
@@ -560,6 +564,45 @@ class Tkinter3DCanvas(tk.Frame):
             self._occlude_lines = enabled
             self._invalidate_geometry_cache()
             self._request_redraw()
+
+    @property
+    def section_plane(self) -> Optional[SectionPlane]:
+        """The configured world-space section plane, or ``None`` when cleared."""
+
+        return self._section_plane
+
+    def set_section_plane(
+        self,
+        normal: Any = (1.0, 0.0, 0.0),
+        offset: float = 0.0,
+        *,
+        enabled: bool = True,
+    ) -> None:
+        """Retain geometry where ``normal · point >= offset``.
+
+        Clipping is a view policy: it leaves retained scene data untouched and
+        intentionally does not create a cap over the cut surface.
+        """
+
+        plane = SectionPlane(normal=as_point(normal), offset=offset, enabled=enabled)
+        if self._section_plane is not None and plane.key == self._section_plane.key:
+            return
+        self._section_plane = plane
+        self._selection_index = None
+        self._selection_index_key = None
+        self._reset_selection_cycle()
+        self._request_redraw()
+
+    def clear_section_plane(self) -> None:
+        """Disable section clipping while preserving the retained scene."""
+
+        if self._section_plane is None:
+            return
+        self._section_plane = None
+        self._selection_index = None
+        self._selection_index_key = None
+        self._reset_selection_cycle()
+        self._request_redraw()
 
     def set_background(self, color: str) -> None:
         self.bg = color
@@ -1680,6 +1723,7 @@ class Tkinter3DCanvas(tk.Frame):
             camera.fov,
             camera.near,
             camera.far,
+            None if self._section_plane is None else self._section_plane.key,
         )
 
     def _get_selection_index(self) -> ProjectedSelectionIndex:
@@ -1708,8 +1752,15 @@ class Tkinter3DCanvas(tk.Frame):
         half_width = 0.5 * plot_width
         half_height = 0.5 * self.height
         near = max(1.0e-9, float(self.camera.near))
+        section_plane = self._section_plane
+        if section_plane is not None and not section_plane.enabled:
+            section_plane = None
         projected: List[ProjectedPrimitive] = []
         primitive_id = 0
+
+        def world_values_to_camera(values: Sequence[Sequence[float]]) -> np.ndarray:
+            world = np.asarray(values, dtype=np.float32).reshape(-1, 3)
+            return (world - origin) @ basis
 
         def screen_points(
             values: Sequence[Sequence[float]],
@@ -1765,19 +1816,40 @@ class Tkinter3DCanvas(tk.Frame):
             if stop <= start:
                 continue
             if bool(scene.face_is_edge[face]):
-                clipped_line = clipped_segment(
-                    camera_space[start], camera_space[min(start + 1, stop - 1)]
-                )
+                if section_plane is None:
+                    edge_camera = camera_space[start:stop]
+                else:
+                    section_line = section_plane.clip_segment(
+                        scene.face_vertices[start],
+                        scene.face_vertices[min(start + 1, stop - 1)],
+                    )
+                    if section_line is None:
+                        continue
+                    edge_camera = world_values_to_camera(
+                        [point.to_tuple() for point in section_line]
+                    )
+                clipped_line = clipped_segment(edge_camera[0], edge_camera[-1])
                 if clipped_line is None:
                     continue
                 points_2d, depths = screen_points(clipped_line)
                 shape = "segment"
                 radius = max(1.5, 0.5 * float(scene.face_width[face]))
             else:
-                camera_polygon = camera_space[start:stop]
-                if bool(np.all(valid[start:stop])):
+                if section_plane is None:
+                    camera_polygon = camera_space[start:stop]
+                else:
+                    section_polygon = section_plane.clip_polygon(
+                        scene.face_vertices[start:stop]
+                    )
+                    if len(section_polygon) < 3:
+                        continue
+                    camera_polygon = world_values_to_camera(
+                        [point.to_tuple() for point in section_polygon]
+                    )
+                polygon_valid = camera_polygon[:, 2] > near
+                if bool(np.all(polygon_valid)):
                     clipped_polygon = [tuple(float(value) for value in row) for row in camera_polygon]
-                elif bool(np.any(valid[start:stop])):
+                elif bool(np.any(polygon_valid)):
                     clipped_polygon = self._clip_near_plane(camera_polygon, near)
                 else:
                     continue
@@ -1816,9 +1888,18 @@ class Tkinter3DCanvas(tk.Frame):
             )
             for line in range(len(scene.line_vertices) // 2):
                 start = 2 * line
-                clipped_line = clipped_segment(
-                    line_camera[start], line_camera[start + 1]
-                )
+                if section_plane is None:
+                    candidate_line = line_camera[start:start + 2]
+                else:
+                    section_line = section_plane.clip_segment(
+                        scene.line_vertices[start], scene.line_vertices[start + 1]
+                    )
+                    if section_line is None:
+                        continue
+                    candidate_line = world_values_to_camera(
+                        [point.to_tuple() for point in section_line]
+                    )
+                clipped_line = clipped_segment(candidate_line[0], candidate_line[1])
                 if clipped_line is None:
                     continue
                 points_2d, depths = screen_points(clipped_line)
@@ -1852,6 +1933,10 @@ class Tkinter3DCanvas(tk.Frame):
             )
             for marker in range(len(scene.marker_points)):
                 if not bool(marker_valid[marker]):
+                    continue
+                if section_plane is not None and not section_plane.contains(
+                    scene.marker_points[marker]
+                ):
                     continue
                 projected.append(
                     ProjectedPrimitive(
@@ -2817,6 +2902,19 @@ class Tkinter3DCanvas(tk.Frame):
         interactive: bool,
     ) -> Tuple[List[int], List[bool], List[float], Dict[int, List[float]]]:
         """Cull, depth-sort and project every face that can show a pixel."""
+        if self._section_plane is not None and self._section_plane.enabled:
+            return self._visible_faces_with_section(
+                scene,
+                origin,
+                basis,
+                x_scale,
+                y_scale,
+                half_width,
+                half_height,
+                near,
+                plot_width,
+                interactive,
+            )
         total = scene.face_total
         if total == 0:
             return [], [], [], {}
@@ -2932,6 +3030,152 @@ class Tkinter3DCanvas(tk.Frame):
             ]
 
         return order, front_facing.tolist(), coords, clipped
+
+    def _visible_faces_with_section(
+        self,
+        scene: _CompiledScene,
+        origin: np.ndarray,
+        basis: np.ndarray,
+        x_scale: float,
+        y_scale: float,
+        half_width: float,
+        half_height: float,
+        near: float,
+        plot_width: int,
+        interactive: bool,
+    ) -> Tuple[List[int], List[bool], List[float], Dict[int, List[float]]]:
+        """Project faces after world-space section and camera-near clipping.
+
+        The normal renderer remains fully vectorised.  A section view takes
+        this opt-in polygon path because intersection vertices have no slots in
+        the compiled arrays.  The resulting cut polygons themselves determine
+        occlusion, so removed portions of analytic cylinder occluders cannot
+        hide retained geometry.
+        """
+
+        plane = self._section_plane
+        if plane is None or not plane.enabled or scene.face_total == 0:
+            return [], [False] * scene.face_total, [], {}
+        front = [False] * scene.face_total
+        entries: List[Tuple[int, float, float, int, List[float]]] = []
+        margin = 20.0
+
+        for face in range(scene.face_total):
+            start = int(scene.face_start[face])
+            stop = start + int(scene.face_count[face])
+            world = scene.face_vertices[start:stop]
+            if len(world) < 2:
+                continue
+
+            if bool(scene.face_is_edge[face]):
+                segment = plane.clip_segment(world[0], world[-1])
+                if segment is None:
+                    continue
+                retained_world = np.asarray(
+                    [point.to_tuple() for point in segment], dtype=np.float32
+                )
+            else:
+                polygon = plane.clip_polygon(world)
+                if len(polygon) < 3:
+                    continue
+                retained_world = np.asarray(
+                    [point.to_tuple() for point in polygon], dtype=np.float32
+                )
+
+            camera_polygon = (retained_world - origin) @ basis
+            if bool(scene.face_is_edge[face]):
+                camera_segment = self._clip_camera_segment(
+                    camera_polygon[0], camera_polygon[-1], near
+                )
+                if camera_segment is None:
+                    continue
+                clipped_camera = list(camera_segment)
+            else:
+                valid = camera_polygon[:, 2] >= near
+                if bool(np.all(valid)):
+                    clipped_camera = [
+                        tuple(float(value) for value in row) for row in camera_polygon
+                    ]
+                elif bool(np.any(valid)):
+                    clipped_camera = self._clip_near_plane(camera_polygon, near)
+                else:
+                    continue
+                if len(clipped_camera) < 3:
+                    continue
+
+            facing = float(np.dot(scene.face_normal[face], origin - scene.face_center[face]))
+            is_front = facing > 0.0
+            front[face] = is_front
+            if bool(scene.face_cull[face]) and not is_front:
+                continue
+
+            coordinates = self._project_camera_space(
+                clipped_camera, x_scale, y_scale, half_width, half_height
+            )
+            if len(coordinates) < 4:
+                continue
+            xs = coordinates[0::2]
+            ys = coordinates[1::2]
+            low_x, high_x = min(xs), max(xs)
+            low_y, high_y = min(ys), max(ys)
+            if (
+                high_x < -margin
+                or low_x > plot_width + margin
+                or high_y < -margin
+                or low_y > self.height + margin
+            ):
+                continue
+            span_x = max(0.0, float(high_x - low_x))
+            span_y = max(0.0, float(high_y - low_y))
+            if span_x < _MIN_SCREEN_EXTENT and span_y < _MIN_SCREEN_EXTENT:
+                continue
+
+            depth = sum(point[2] for point in clipped_camera) / len(clipped_camera)
+            extent = (span_x + 1.0) * (span_y + 1.0)
+            phase = (
+                (2 if is_front else 0)
+                if int(scene.face_phase[face]) == 0
+                else 1
+            )
+            entries.append((face, depth, extent, phase, coordinates))
+
+        if interactive and len(entries) > self._fast_polygon_target:
+            entries.sort(key=lambda entry: entry[2], reverse=True)
+            entries = entries[: self._fast_polygon_target]
+
+        layer_epsilon = max(1.0e-9, max(float(self.camera.distance), 1.0) * 1.0e-6)
+        entries.sort(
+            key=lambda entry: (
+                entry[3],
+                -(entry[1] - float(scene.face_layer[entry[0]]) * layer_epsilon),
+            )
+        )
+        order = [entry[0] for entry in entries]
+        clipped = {entry[0]: entry[4] for entry in entries}
+        return order, front, [], clipped
+
+    @staticmethod
+    def _clip_camera_segment(
+        first: Sequence[float], second: Sequence[float], near: float
+    ) -> Optional[Tuple[Tuple[float, float, float], Tuple[float, float, float]]]:
+        a = tuple(float(value) for value in first)
+        b = tuple(float(value) for value in second)
+        a_inside = a[2] >= near
+        b_inside = b[2] >= near
+        if a_inside and b_inside:
+            return a, b
+        if not a_inside and not b_inside:
+            return None
+        span = b[2] - a[2]
+        if abs(span) <= _EPS:
+            return None
+        parameter = (near - a[2]) / span
+        intersection = (
+            a[0] + parameter * (b[0] - a[0]),
+            a[1] + parameter * (b[1] - a[1]),
+            near,
+        )
+        return (a, intersection) if a_inside else (intersection, b)
 
     @staticmethod
     def _clip_near_plane(camera_space: np.ndarray, near: float) -> List[Tuple[float, float, float]]:
@@ -3095,24 +3339,69 @@ class Tkinter3DCanvas(tk.Frame):
             self._hide_unused(self._line_pool, self._line_state, 0)
             return
 
-        _camera_space, screen_x, screen_y, valid = self._project(
-            scene.line_vertices, origin, basis, x_scale, y_scale, half_width, half_height, near
-        )
-        pair_valid = valid[0::2] & valid[1::2]
-        index = np.nonzero(pair_valid)[0]
-        if len(index) == 0:
-            self._hide_unused(self._line_pool, self._line_state, 0)
-            return
-
-        depth = (
-            (scene.line_vertices[0::2] + scene.line_vertices[1::2]) * 0.5 - origin
-        ) @ basis[:, 2]
-        index = index[np.argsort(-depth[index], kind="stable")]
-
-        x0 = np.clip(np.nan_to_num(screen_x[0::2]), -_COORD_LIMIT, _COORD_LIMIT)
-        y0 = np.clip(np.nan_to_num(screen_y[0::2]), -_COORD_LIMIT, _COORD_LIMIT)
-        x1 = np.clip(np.nan_to_num(screen_x[1::2]), -_COORD_LIMIT, _COORD_LIMIT)
-        y1 = np.clip(np.nan_to_num(screen_y[1::2]), -_COORD_LIMIT, _COORD_LIMIT)
+        plane = self._section_plane
+        if plane is not None and plane.enabled:
+            source_lines: List[int] = []
+            section_x0: List[float] = []
+            section_y0: List[float] = []
+            section_x1: List[float] = []
+            section_y1: List[float] = []
+            section_depth: List[float] = []
+            for line in range(total):
+                start = 2 * line
+                segment = plane.clip_segment(
+                    scene.line_vertices[start], scene.line_vertices[start + 1]
+                )
+                if segment is None:
+                    continue
+                world = np.asarray(
+                    [point.to_tuple() for point in segment], dtype=np.float32
+                )
+                camera_segment = (world - origin) @ basis
+                clipped_segment = self._clip_camera_segment(
+                    camera_segment[0], camera_segment[1], near
+                )
+                if clipped_segment is None:
+                    continue
+                coordinates = self._project_camera_space(
+                    clipped_segment, x_scale, y_scale, half_width, half_height
+                )
+                source_lines.append(line)
+                section_x0.append(float(coordinates[0]))
+                section_y0.append(float(coordinates[1]))
+                section_x1.append(float(coordinates[2]))
+                section_y1.append(float(coordinates[3]))
+                section_depth.append(
+                    0.5 * (clipped_segment[0][2] + clipped_segment[1][2])
+                )
+            if not source_lines:
+                self._hide_unused(self._line_pool, self._line_state, 0)
+                return
+            x0 = np.asarray(section_x0)
+            y0 = np.asarray(section_y0)
+            x1 = np.asarray(section_x1)
+            y1 = np.asarray(section_y1)
+            depth = np.asarray(section_depth)
+            source = np.asarray(source_lines, dtype=np.int64)
+            index = np.argsort(-depth, kind="stable")
+        else:
+            _camera_space, screen_x, screen_y, valid = self._project(
+                scene.line_vertices, origin, basis, x_scale, y_scale, half_width, half_height, near
+            )
+            pair_valid = valid[0::2] & valid[1::2]
+            index = np.nonzero(pair_valid)[0]
+            if len(index) == 0:
+                self._hide_unused(self._line_pool, self._line_state, 0)
+                return
+            depth = (
+                (scene.line_vertices[0::2] + scene.line_vertices[1::2]) * 0.5 - origin
+            ) @ basis[:, 2]
+            index = index[np.argsort(-depth[index], kind="stable")]
+            source = np.arange(total, dtype=np.int64)
+            x0 = np.clip(np.nan_to_num(screen_x[0::2]), -_COORD_LIMIT, _COORD_LIMIT)
+            y0 = np.clip(np.nan_to_num(screen_y[0::2]), -_COORD_LIMIT, _COORD_LIMIT)
+            x1 = np.clip(np.nan_to_num(screen_x[1::2]), -_COORD_LIMIT, _COORD_LIMIT)
+            y1 = np.clip(np.nan_to_num(screen_y[1::2]), -_COORD_LIMIT, _COORD_LIMIT)
 
         needed = len(index)
         self._ensure_pool(
@@ -3134,10 +3423,11 @@ class Tkinter3DCanvas(tk.Frame):
         selected = self._pick.highlight_tags
         preselected = self._pick.preselection_key
 
-        for slot, line in enumerate(index.tolist()):
+        for slot, projected_line in enumerate(index.tolist()):
+            line = int(source[projected_line])
             item = pool[slot]
-            call((widget, "coords", item, round(float(x0[line])), round(float(y0[line])),
-                  round(float(x1[line])), round(float(y1[line]))))
+            call((widget, "coords", item, round(float(x0[projected_line])), round(float(y0[projected_line])),
+                  round(float(x1[projected_line])), round(float(y1[projected_line]))))
             tag = line_tags[line] if any_line_tags else ""
             binding = line_bindings[line] if line < len(line_bindings) else None
             keys = () if binding is None else tuple(owner.key for owner in binding.owners)
@@ -3202,6 +3492,10 @@ class Tkinter3DCanvas(tk.Frame):
             & (screen_y >= -margin)
             & (screen_y <= self.height + margin)
         )
+        plane = self._section_plane
+        if plane is not None and plane.enabled:
+            normal = np.asarray(plane.normal.to_tuple(), dtype=np.float32)
+            visible &= scene.marker_points @ normal >= float(plane.offset)
         index = np.nonzero(visible)[0]
         if len(index) == 0:
             self._hide_unused(self._marker_pool, self._marker_state, 0)
@@ -3285,6 +3579,10 @@ class Tkinter3DCanvas(tk.Frame):
             & (screen_y >= -margin)
             & (screen_y <= self.height + margin)
         )
+        plane = self._section_plane
+        if plane is not None and plane.enabled:
+            normal = np.asarray(plane.normal.to_tuple(), dtype=np.float32)
+            visible &= scene.text_points @ normal >= float(plane.offset)
         index = np.nonzero(visible)[0]
         if len(index) == 0:
             self._hide_unused(self._text_pool, self._text_state, 0)

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ANYtk3D"
-version = "0.2.2"
+version = "0.2.3"
 description = "Fast dependency-free 3D drawing on a Tkinter Canvas - solids, meshes, lighting, layered transparency and depth-correct painter rendering without OpenGL or matplotlib"
 readme = "README.md"
 license = "GPL-3.0-or-later"
@@ -45,6 +45,7 @@ classifiers = [
 ]
 dependencies = [
     "numpy",
+    "ANY3dView>=0.1,<0.2",
 ]
 
 [project.optional-dependencies]
@@ -65,5 +66,7 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
+    "gui: opt-in test that creates a real Tk desktop window",
     "native_gui: opt-in tests that drive a real interactive desktop with native input",
+    "packaging: bounded clean-source distribution smoke test",
 ]

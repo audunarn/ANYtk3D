@@ -93,6 +93,24 @@ def test_faces_are_painted_back_to_front(canvas):
     assert near_box_drawn_last(180.0)
 
 
+def test_section_plane_clips_overlay_lines_markers_and_text(canvas, root):
+    canvas.add_line(
+        Point3D(-2, 0, 0), Point3D(2, 0, 0), draw_overlay=True
+    )
+    canvas.add_markers([Point3D(-1, 0, 0), Point3D(1, 0, 0)])
+    canvas.add_text(Point3D(-1, 0, 0), "clipped")
+    canvas.add_text(Point3D(1, 0, 0), "kept")
+    canvas.fit_to_scene(redraw=False)
+    canvas.set_section_plane((1, 0, 0), 0)
+    canvas.redraw()
+    root.update()
+
+    assert len(canvas._line_pool) == 1
+    assert len(canvas._marker_pool) == 1
+    assert len(canvas._text_pool) == 1
+    assert canvas.canvas.itemcget(canvas._text_pool[0], "text") == "kept"
+
+
 def test_orbiting_swaps_which_object_is_in_front(canvas):
     canvas.add_box(1.0, 1.0, 1.0, center=Point3D(-3.0, 0.0, 0.0), color='#ff0000')
     canvas.add_box(1.0, 1.0, 1.0, center=Point3D(3.0, 0.0, 0.0), color='#0000ff')

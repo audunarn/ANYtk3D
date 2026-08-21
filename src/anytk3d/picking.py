@@ -205,6 +205,22 @@ class SelectionEvent:
     cycle_total: int = 0
 
 
+# Semantic selection values live in ANY3dView.  Rebinding the names here keeps
+# the historic ``anytk3d.picking`` import path and exact cross-package identity.
+from any3dview.selection import (  # noqa: E402
+    PickBinding,
+    PickOwner,
+    SelectionConfig,
+    SelectionDepth,
+    SelectionEvent,
+    SelectionFilter,
+    SelectionGesture,
+    SelectionHit,
+    SelectionOperation,
+    SelectionTool,
+)
+
+
 @dataclass(frozen=True)
 class Pick:
     """One hit returned by a click or a hover."""

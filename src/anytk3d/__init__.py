@@ -57,8 +57,9 @@ from .picking import (
     SelectionOperation,
     SelectionTool,
 )
+from any3dview import SectionPlane
 
-__version__ = "0.2.2"
+__version__ = "0.2.3"
 
 __all__ = [
     "DEFAULT_COLOR_STOPS",
@@ -77,6 +78,7 @@ __all__ = [
     "SelectionHit",
     "SelectionOperation",
     "SelectionTool",
+    "SectionPlane",
     "Tkinter3DCanvas",
     "create_stiffened_cylinder_demo",
     "get_color_stops",
