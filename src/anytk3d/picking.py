@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, FrozenSet, Iterable, Optional, Sequence, Tuple
 
+from any3dview.contracts import Pick
+
 __all__ = [
     "Pick",
     "PickBinding",
@@ -219,19 +221,6 @@ from any3dview.selection import (  # noqa: E402
     SelectionOperation,
     SelectionTool,
 )
-
-
-@dataclass(frozen=True)
-class Pick:
-    """One hit returned by a click or a hover."""
-
-    tag: str
-    item: int
-    x: int
-    y: int
-    shift: bool = False
-    ctrl: bool = False
-    alt: bool = False
 
 
 def entity_tag_at(

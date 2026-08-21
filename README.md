@@ -84,12 +84,53 @@ handle.update_displacements(next_displacements)
 handle.set_deformation_scale(20.0)
 handle.set_active_elements(active_mask)
 handle.set_selected_elements(selected_elements)
+
+# Incremental chunks may carry their own packed semantic owner table.
+handle.add_chunk("local-remesh", replacement_arrays, owners=chunk_owners)
 ```
 
 Compatible C-contiguous arrays are retained without copying and are treated as
 immutable while registered. Scalar-only changes reuse connectivity, geometry
-and packed ownership. Cross-thread producers can use
+and packed ownership. Selected elements receive the same application-selection
+tint as the GPU backend. Chunk-local owner tables drive face, line, and point
+picking; when omitted, the handle's legacy tag remains the compatibility
+fallback. Cross-thread producers can use
 `canvas.submit_update(handle.update_element_scalars, immutable_values)`.
+
+### Shared backend contract
+
+ANYtk3D 0.5 implements the renderer-neutral integration contract shared with
+the optional ANY3dView GPU viewer. Applications can use
+`any3dview.create_viewer` and select `backend="auto"`, `"gpu"`, or
+`"software"` without importing a concrete renderer up front. The software
+viewer reports `backend_name == "software"`; `backend_diagnostics` retains
+any reason that automatic GPU selection fell back.
+
+Use `event_widget` for input bindings and `viewport_size` for the current
+drawable size. `project_point`, `project_points`, `screen_ray`, and
+`unproject_to_plane` form the public modelling/projection boundary and avoid
+access to Tk-specific canvas internals.
+
+```python
+from any3dview import create_viewer
+
+viewer = create_viewer(root, backend="auto")
+viewer.event_widget.bind("<Escape>", cancel_current_tool)
+screen_position = viewer.project_point(world_position)
+```
+
+Live renderer replacement transfers camera and view policy with
+`export_view_state()` and `apply_view_state()`. Geometry is deliberately not
+part of `ViewerState`: populate the candidate viewer from application-owned
+scene data, apply the state, and only then replace the working widget.
+`Pick`, `ViewerState`, `ViewerBackend`, and the established geometry and
+selection types are exact re-exports of their ANY3dView definitions.
+
+`capture_image()` returns an RGBA Pillow image of the mapped inner canvas when
+Pillow is installed (the integrated GUI application extras install it). The
+base ANYtk3D import remains Pillow-independent; an unmapped or unavailable
+desktop reports an actionable `RuntimeError` instead of capturing window
+chrome or an unrelated screen region.
 
 ### Shapes
 

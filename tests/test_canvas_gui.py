@@ -2,10 +2,13 @@
 GUI tests - create a real Tkinter3DCanvas and populate the demo scenes.
 Skipped automatically when no display is available.
 '''
+from dataclasses import replace
 import tkinter as tk
 
+import numpy as np
 import pytest
 
+from any3dview import MeshArrays
 from anytk3d import (
     Point3D,
     Tkinter3DCanvas,
@@ -14,6 +17,7 @@ from anytk3d import (
     populate_stiffened_cylinder,
     populate_stiffened_plate,
 )
+from anytk3d.canvas import _mix_color
 
 
 @pytest.fixture
@@ -83,3 +87,91 @@ def test_camera_orbit_and_zoom(root):
     canvas.redraw()
 
     assert canvas.camera.position.to_tuple() != before
+
+
+def test_shared_viewer_contract_on_real_tk_widget(root):
+    canvas = Tkinter3DCanvas(root, width=320, height=180, bg="white")
+    canvas.pack()
+    root.update()
+
+    canvas.set_section_plane((1, 0, 0), -1.0)
+    state = canvas.export_view_state()
+    replacement = replace(
+        state,
+        background="#112233",
+        section_plane=None,
+        mesh_lines=False,
+        interaction_profile="commercial",
+    )
+    canvas.apply_view_state(replacement, redraw=False)
+
+    assert canvas.backend_name == "software"
+    assert canvas.event_widget is canvas.canvas
+    assert canvas.viewport_size[0] > 1
+    assert canvas.viewport_size[1] > 1
+    assert canvas.project_point(canvas.camera.target) is not None
+    assert canvas.section_plane is None
+    assert canvas.bg == "#112233"
+    assert canvas.interaction_profile == "commercial"
+
+
+def test_viewer_destroy_is_idempotent(root):
+    canvas = Tkinter3DCanvas(root, width=160, height=100)
+    canvas.pack()
+    root.update_idletasks()
+
+    canvas.destroy()
+    canvas.destroy()
+
+
+def test_retained_selected_elements_are_visually_distinct(root):
+    canvas = Tkinter3DCanvas(
+        root, width=320, height=220, bg="white", shading=False
+    )
+    canvas.pack()
+    mesh = MeshArrays(
+        np.asarray(
+            [[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0]],
+            dtype=np.float32,
+        ),
+        np.asarray([[0, 1, 2], [1, 3, 2]], dtype=np.uint32),
+        triangle_to_element=np.asarray([0, 1], dtype=np.uint32),
+    )
+    handle = canvas.add_mesh_arrays(
+        mesh, color="#224466", cull_backface=False
+    )
+    handle.set_selected_elements((1,))
+    canvas.fit_to_scene(redraw=False)
+    canvas.redraw()
+    root.update()
+
+    fills = {
+        state[0]
+        for state in canvas._polygon_state
+        if state is not None
+    }
+    assert fills == {
+        "#224466",
+        _mix_color("#224466", canvas._pick.highlight_fill, 0.65),
+    }
+
+
+def test_capture_image_from_mapped_native_tk_viewport(root):
+    pytest.importorskip("PIL.ImageGrab")
+    root.geometry("360x260+50+50")
+    root.deiconify()
+    root.attributes("-topmost", True)
+    canvas = Tkinter3DCanvas(root, bg="#f4f7fb")
+    canvas.pack(fill="both", expand=True)
+    canvas.add_box(1.0, color="#336699", outline="#102030")
+    canvas.fit_to_scene(redraw=False)
+    canvas.redraw()
+    root.update()
+
+    assert canvas.event_widget.winfo_ismapped()
+    expected_size = canvas.viewport_size
+    image = canvas.capture_image()
+
+    assert image.mode == "RGBA"
+    assert image.size == expected_size
+    assert image.getbbox() is not None

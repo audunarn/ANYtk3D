@@ -69,8 +69,9 @@ from any3dview import (
     ViewerCapabilities,
     ViewerScheduler,
 )
+from any3dview.contracts import ViewerBackend, ViewerState
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = [
     "ApplicationOwner",
@@ -99,7 +100,9 @@ __all__ = [
     "SectionPlane",
     "Tkinter3DCanvas",
     "ViewerCapabilities",
+    "ViewerBackend",
     "ViewerScheduler",
+    "ViewerState",
     "create_stiffened_cylinder_demo",
     "get_color_stops",
     "main",

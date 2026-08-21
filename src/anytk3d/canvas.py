@@ -48,6 +48,7 @@ The cylinder axis is the global Z axis.
 
 from __future__ import annotations
 
+import importlib.util
 import math
 import sys
 import time
@@ -65,6 +66,7 @@ from any3dview import (
     ViewerScheduler,
 )
 from any3dview.clipping import SectionPlane
+from any3dview.contracts import ViewerBackend, ViewerState
 
 from . import shapes as shapes_module
 from . import stipple as stipple_module
@@ -123,6 +125,7 @@ __all__ = [
     "Mesh",
     "MeshArrays",
     "MeshHandle",
+    "Pick",
     "PickBinding",
     "PickOwner",
     "Point3D",
@@ -137,6 +140,8 @@ __all__ = [
     "SectionPlane",
     "Tkinter3DCanvas",
     "ViewerCapabilities",
+    "ViewerBackend",
+    "ViewerState",
     "create_stiffened_cylinder_demo",
     "get_color_stops",
     "reset_color_stops",
@@ -160,7 +165,32 @@ SOFTWARE_CAPABILITIES = ViewerCapabilities(
     clipping_planes=True,
     transparency=True,
     software_fallback=True,
+    legacy_primitives=True,
+    text_hud=True,
+    legends=True,
+    camera_controls=True,
+    work_plane_projection=True,
+    hover_selection=True,
+    region_selection=True,
+    lasso_selection=True,
+    animation=True,
+    image_capture=importlib.util.find_spec("PIL") is not None,
+    line_occlusion=True,
+    stippled_transparency=True,
 )
+
+
+def _mix_color(base: str, overlay: str, amount: float) -> str:
+    """Blend two renderer colours, falling back to the overlay when unknown."""
+
+    first = parse_color(str(base))
+    second = parse_color(str(overlay))
+    if first is None or second is None:
+        return str(overlay)
+    weight = max(0.0, min(1.0, float(amount)))
+    return _rgb_to_hex(
+        *(left + weight * (right - left) for left, right in zip(first, second))
+    )
 
 
 # Canvas item tags used by the render pools.  Keeping them distinct lets the
@@ -289,6 +319,7 @@ class _CompiledScene:
         "face_occludable",
         "face_lit",
         "face_is_edge",
+        "face_application_selected",
         "face_width",
         "base_front",
         "base_back",
@@ -348,6 +379,7 @@ class _CompiledScene:
         self.face_occludable = np.empty(0, dtype=bool)
         self.face_lit = np.empty(0, dtype=bool)
         self.face_is_edge = np.empty(0, dtype=bool)
+        self.face_application_selected = np.empty(0, dtype=bool)
         self.face_width: List[int] = []
         self.base_front: List[str] = []
         self.base_back: List[str] = []
@@ -499,6 +531,7 @@ class Tkinter3DCanvas(tk.Frame):
         **canvas_kwargs: Any,
     ) -> None:
         super().__init__(master, background=bg)
+        self._destroyed = False
 
         self.width = max(1, int(width))
         self.height = max(1, int(height))
@@ -726,10 +759,113 @@ class Tkinter3DCanvas(tk.Frame):
         return SOFTWARE_CAPABILITIES
 
     @property
+    def backend_name(self) -> str:
+        """Stable factory token for this renderer."""
+
+        return "software"
+
+    @property
     def backend_diagnostics(self) -> Tuple[str, ...]:
         """Diagnostics retained when ``create_viewer(auto)`` fell back here."""
 
         return self._backend_diagnostics
+
+    @property
+    def event_widget(self) -> tk.Canvas:
+        """Widget applications should bind pointer and keyboard events to.
+
+        ``canvas`` remains public for backwards compatibility.  New backend-
+        neutral integrations use this property instead of knowing that the
+        software renderer happens to draw into a nested :class:`tk.Canvas`.
+        """
+
+        return self.canvas
+
+    @property
+    def viewport_size(self) -> Tuple[int, int]:
+        """Current drawable width and height in pixels."""
+
+        return self._viewport_size()
+
+    def export_view_state(self) -> ViewerState:
+        """Return the renderer-neutral view policy for backend replacement."""
+
+        camera = self.camera
+        plane = self._section_plane
+        if plane is not None:
+            plane = SectionPlane(
+                normal=plane.normal.to_tuple(),
+                offset=plane.offset,
+                enabled=plane.enabled,
+            )
+        return ViewerState(
+            camera_position=Point3D(*camera.position.to_tuple()),
+            camera_target=Point3D(*camera.target.to_tuple()),
+            camera_world_up=Point3D(*camera.world_up.to_tuple()),
+            fov=float(camera.fov),
+            near=float(camera.near),
+            far=float(camera.far),
+            section_plane=plane,
+            background=str(self.bg),
+            shading_enabled=bool(self._shading_enabled),
+            occlude_lines=bool(self._occlude_lines),
+            mesh_lines=bool(self.show_mesh_lines),
+            axis_indicator=bool(self._show_axis_indicator),
+            axis_ruler=bool(self.show_axis_ruler),
+            interaction_profile=str(self._interaction_profile),
+        )
+
+    def apply_view_state(self, state: ViewerState, *, redraw: bool = True) -> None:
+        """Apply portable camera and rendering policy in one invalidation.
+
+        Scene objects deliberately do not belong to :class:`ViewerState`;
+        applications repopulate a replacement backend before applying it.
+        """
+
+        if not isinstance(state, ViewerState):
+            raise TypeError("state must be a ViewerState")
+        if not (0.0 < float(state.near) < float(state.far)):
+            raise ValueError("viewer state requires 0 < near < far")
+        if not (0.0 < float(state.fov) < math.pi):
+            raise ValueError("viewer state fov must be between 0 and pi")
+        interaction_profile = str(state.interaction_profile).strip().lower()
+        if interaction_profile not in {"legacy", "commercial"}:
+            raise ValueError("interaction profile must be 'legacy' or 'commercial'")
+
+        world_up = as_point(state.camera_world_up).normalized()
+        if world_up.length() <= _EPS:
+            raise ValueError("camera_world_up must be non-zero")
+        camera = self.camera
+        camera.world_up = world_up
+        camera.fov = float(state.fov)
+        camera.near = float(state.near)
+        camera.far = float(state.far)
+        camera.set_target(as_point(state.camera_target))
+        camera.set_position(as_point(state.camera_position))
+
+        self.bg = str(state.background)
+        self.canvas.configure(background=self.bg)
+        self.configure(background=self.bg)
+        self._shading_enabled = bool(state.shading_enabled)
+        self._occlude_lines = bool(state.occlude_lines)
+        self.show_mesh_lines = bool(state.mesh_lines)
+        self._show_axis_indicator = bool(state.axis_indicator)
+        self.show_axis_ruler = bool(state.axis_ruler)
+        self.set_interaction_profile(interaction_profile)
+        plane = state.section_plane
+        self._section_plane = (
+            None
+            if plane is None
+            else SectionPlane(
+                normal=plane.normal.to_tuple(),
+                offset=plane.offset,
+                enabled=plane.enabled,
+            )
+        )
+        self._interactive_render = False
+        self._invalidate_geometry_cache()
+        if redraw:
+            self._request_redraw(interactive=False)
 
     @property
     def section_plane(self) -> Optional[SectionPlane]:
@@ -1315,6 +1451,18 @@ class Tkinter3DCanvas(tk.Frame):
             self._selection_config = config
         self._reset_selection_cycle()
 
+    def set_selection_callback(
+        self,
+        callback: Optional[Callable[[SelectionEvent], None]],
+    ) -> None:
+        """Set only the semantic selection callback.
+
+        This narrow alias matches the retained GPU viewer while
+        :meth:`configure_selection` remains the full policy API.
+        """
+
+        self._selection_callback = callback
+
     @property
     def selection_config(self) -> SelectionConfig:
         return self._selection_config
@@ -1380,6 +1528,67 @@ class Tkinter3DCanvas(tk.Frame):
             points,
             selection_filter or config.filter,
             depth=SelectionDepth(config.depth if depth is None else depth),
+        )
+
+    def project_point(self, point: Any) -> Optional[Tuple[float, float, float]]:
+        """Project one world point to ``(screen_x, screen_y, depth)``.
+
+        ``None`` means the point is outside the camera's near/far depth range.
+        Depth is positive camera-space distance and is therefore directly
+        comparable across projected points.
+        """
+
+        return self.project_points((point,))[0]
+
+    def project_points(
+        self,
+        points: Iterable[Any],
+    ) -> Tuple[Optional[Tuple[float, float, float]], ...]:
+        """Vector-project world points using the same viewport as rendering."""
+
+        world_points = tuple(as_point(point) for point in points)
+        if not world_points:
+            return ()
+
+        self.width, self.height = self._viewport_size()
+        plot_width = max(1, self._plot_width())
+        height = max(1, self.height)
+        camera = self.camera
+        right, camera_up, forward = camera.basis()
+        position = camera.position
+        values = np.asarray(
+            [point.to_tuple() for point in world_points], dtype=np.float64
+        )
+        origin = np.asarray(position.to_tuple(), dtype=np.float64)
+        basis = np.asarray(
+            [
+                [right.x, camera_up.x, forward.x],
+                [right.y, camera_up.y, forward.y],
+                [right.z, camera_up.z, forward.z],
+            ],
+            dtype=np.float64,
+        )
+        camera_space = (values - origin) @ basis
+        depth = camera_space[:, 2]
+        valid = (
+            np.isfinite(camera_space).all(axis=1)
+            & (depth > max(1.0e-9, float(camera.near)))
+            & (depth < float(camera.far))
+        )
+        safe_depth = np.where(valid, depth, 1.0)
+        y_scale = 1.0 / math.tan(float(camera.fov) / 2.0)
+        x_scale = y_scale * float(height) / float(plot_width)
+        screen_x = (camera_space[:, 0] * x_scale / safe_depth + 1.0) * (
+            0.5 * plot_width
+        )
+        screen_y = (1.0 - camera_space[:, 1] * y_scale / safe_depth) * (
+            0.5 * height
+        )
+        return tuple(
+            None
+            if not is_valid
+            else (float(x), float(y), float(z))
+            for x, y, z, is_valid in zip(screen_x, screen_y, depth, valid)
         )
 
     def screen_ray(self, x: float, y: float) -> Tuple[Point3D, Point3D]:
@@ -2289,6 +2498,41 @@ class Tkinter3DCanvas(tk.Frame):
         # Restore normal view
         self._request_redraw(interactive=False)
 
+    def capture_image(self):
+        """Return the visible drawable area as a top-left-oriented Pillow image.
+
+        Tk has no dependency-free raster readback.  When Pillow is installed,
+        capture the mapped inner canvas rather than its surrounding frame,
+        toolbars, or window chrome.  Pillow remains a lazy optional import.
+        """
+
+        try:
+            from PIL import ImageGrab
+        except ImportError as error:  # pragma: no cover - optional dependency
+            raise RuntimeError(
+                "capture_image requires Pillow (installed by the GUI application extras)"
+            ) from error
+
+        widget = self.event_widget
+        try:
+            widget.update_idletasks()
+            x0 = int(widget.winfo_rootx())
+            y0 = int(widget.winfo_rooty())
+            width = int(widget.winfo_width())
+            height = int(widget.winfo_height())
+        except (AttributeError, TypeError, ValueError, tk.TclError) as error:
+            raise RuntimeError("the software viewport is not available for capture") from error
+        if width <= 1 or height <= 1:
+            raise RuntimeError("the software viewport must be visible before capture")
+        try:
+            return ImageGrab.grab(
+                bbox=(x0, y0, x0 + width, y0 + height)
+            ).convert("RGBA")
+        except (OSError, RuntimeError, ValueError) as error:
+            raise RuntimeError(
+                "the operating system could not capture the visible software viewport"
+            ) from error
+
     def _animation_tick(self) -> None:
         if not self._is_playing_animation or not self._animation_cache:
             return
@@ -2369,10 +2613,18 @@ class Tkinter3DCanvas(tk.Frame):
         if hasattr(self, "_pick"):
             self._pick.set_preselection(None)
         self._invalidate_geometry_cache()
-        if not keep_canvas:
+        if keep_canvas:
+            # Retained-handle removal callbacks request a redraw.  Preserve
+            # the historic keep_canvas contract by cancelling that idle draw
+            # after the scene state has been cleared.
+            self._cancel_scheduled_redraw()
+        else:
             self._clear_canvas_only()
 
     def destroy(self) -> None:
+        if getattr(self, "_destroyed", False):
+            return
+        self._destroyed = True
         scheduler = getattr(self, "_update_scheduler", None)
         if scheduler is not None:
             poll_id = getattr(self, "_update_poll_id", None)
@@ -2597,6 +2849,7 @@ class Tkinter3DCanvas(tk.Frame):
         face_cull: List[bool] = []
         face_lit: List[bool] = []
         face_is_edge: List[bool] = []
+        face_application_selected: List[bool] = []
         opaque: List[bool] = []
         fast_no_outline: List[bool] = []
 
@@ -2701,6 +2954,15 @@ class Tkinter3DCanvas(tk.Frame):
                 face_cull.extend([bool(primitive.get("cull_backface", False))] * total)
                 face_lit.extend([bool(primitive.get("lit", True))] * total)
                 face_is_edge.extend([False] * total)
+                selected = np.asarray(
+                    primitive.get("application_selected", np.zeros(total, dtype=bool)),
+                    dtype=bool,
+                )
+                if selected.shape != (total,):
+                    raise ValueError(
+                        "application_selected must have one value per face"
+                    )
+                face_application_selected.extend(selected.tolist())
                 fast_no_outline.extend(
                     [bool(primitive.get("fast_no_outline", True))] * total
                 )
@@ -2839,6 +3101,7 @@ class Tkinter3DCanvas(tk.Frame):
                 face_cull.append(False)
                 face_lit.append(False)
                 face_is_edge.append(True)
+                face_application_selected.append(False)
                 opaque.append(True)
                 fast_no_outline.append(False)
                 scene.base_front.append("")
@@ -2875,6 +3138,7 @@ class Tkinter3DCanvas(tk.Frame):
             face_cull.append(bool(primitive.get("cull_backface", False)))
             face_lit.append(bool(primitive.get("lit", True)))
             face_is_edge.append(False)
+            face_application_selected.append(False)
             fast_no_outline.append(bool(primitive.get("fast_no_outline", True)))
 
             color = primitive["color"]
@@ -2919,6 +3183,10 @@ class Tkinter3DCanvas(tk.Frame):
         scene.face_cull = np.asarray(face_cull, dtype=bool) if count else np.empty(0, bool)
         scene.face_lit = np.asarray(face_lit, dtype=bool) if count else np.empty(0, bool)
         scene.face_is_edge = np.asarray(face_is_edge, dtype=bool) if count else np.empty(0, bool)
+        scene.face_application_selected = (
+            np.asarray(face_application_selected, dtype=bool)
+            if count else np.empty(0, bool)
+        )
         scene.opaque = np.asarray(opaque, dtype=bool) if count else np.empty(0, bool)
         scene.fast_no_outline = (
             np.asarray(fast_no_outline, dtype=bool) if count else np.empty(0, bool)
@@ -3595,6 +3863,7 @@ class Tkinter3DCanvas(tk.Frame):
         fast_no_outline = scene.fast_no_outline
         opaque = scene.opaque
         is_edge = scene.face_is_edge
+        application_selected = scene.face_application_selected
 
         # Resolved once per scene and highlight generation, so orbiting a
         # highlighted model does not re-split every tag string every frame.
@@ -3602,6 +3871,7 @@ class Tkinter3DCanvas(tk.Frame):
         preselected = self._pick.preselected_faces(scene)
         highlight_fill = self._pick.highlight_fill
         highlight_outline = self._pick.highlight_outline
+        application_selection_fills: Dict[str, str] = {}
 
         for slot, face in enumerate(order):
             item = pool[slot]
@@ -3631,6 +3901,13 @@ class Tkinter3DCanvas(tk.Frame):
                 outline = fill if opaque[face] else ""
             else:
                 outline = outlines[face]
+
+            if application_selected[face] and not is_edge[face]:
+                selected_fill = application_selection_fills.get(fill)
+                if selected_fill is None:
+                    selected_fill = _mix_color(fill, highlight_fill, 0.65)
+                    application_selection_fills[fill] = selected_fill
+                fill = selected_fill
 
             if highlighted is not None and face in highlighted:
                 if not is_edge[face]:
@@ -4247,12 +4524,25 @@ class Tkinter3DCanvas(tk.Frame):
         handle = obj["handle"]
         if handle.removed or not handle.visible:
             return []
-        sources = [(None, handle.mesh), *handle.chunks]
+        chunk_records = getattr(handle, "chunk_records", None)
+        if chunk_records is None:  # compatibility with the 0.4 retained core
+            chunk_records = tuple(
+                (chunk_id, mesh, None, None)
+                for chunk_id, mesh in handle.chunks
+            )
+        sources = [
+            (
+                None,
+                handle.mesh,
+                obj.get("owners"),
+                obj.get("owner_resolver"),
+            ),
+            *chunk_records,
+        ]
         result: List[Dict[str, Any]] = []
         geometry_cache = obj.setdefault("_array_geometry_cache", {})
-        owner_table = obj.get("owners")
 
-        for chunk_id, mesh in sources:
+        for chunk_id, mesh, owner_table, owner_resolver in sources:
             mapping = (
                 mesh.triangle_to_element
                 if mesh.triangle_to_element is not None
@@ -4300,6 +4590,13 @@ class Tkinter3DCanvas(tk.Frame):
             if len(face_indices):
                 colors = self._retained_colors(mesh, face_indices, obj)
                 back = obj.get("back_color")
+                application_selected = np.zeros(len(face_indices), dtype=bool)
+                if chunk_id is None and len(handle.selected_elements):
+                    application_selected = np.isin(
+                        mapping[face_indices],
+                        handle.selected_elements,
+                        assume_unique=False,
+                    )
                 result.append(
                     {
                         "kind": "faces",
@@ -4318,9 +4615,10 @@ class Tkinter3DCanvas(tk.Frame):
                         "tags": obj.get("tags", ""),
                         "lit": bool(obj.get("lit", True)),
                         "two_sided_shell": bool(obj.get("two_sided_shell", False)),
-                        "owner_table": owner_table if chunk_id is None else None,
+                        "application_selected": application_selected,
+                        "owner_table": owner_table,
                         "owner_primitives": face_indices,
-                        "owner_resolver": obj.get("owner_resolver"),
+                        "owner_resolver": owner_resolver,
                     }
                 )
 
@@ -4335,9 +4633,9 @@ class Tkinter3DCanvas(tk.Frame):
                         "width": int(obj.get("line_width") or obj.get("width", 1)),
                         "layer": int(obj.get("line_layer", 30)),
                         "tags": obj.get("tags", ""),
-                        "owner_table": owner_table if chunk_id is None else None,
+                        "owner_table": owner_table,
                         "owner_primitives": np.arange(len(mesh.lines), dtype=np.uint32),
-                        "owner_resolver": obj.get("owner_resolver"),
+                        "owner_resolver": owner_resolver,
                     }
                 )
             if mesh.point_indices is not None and len(mesh.point_indices):
@@ -4351,9 +4649,9 @@ class Tkinter3DCanvas(tk.Frame):
                         "sizes": [int(obj.get("point_size", 6))] * total,
                         "layer": int(obj.get("point_layer", 32)),
                         "tags": obj.get("tags", ""),
-                        "owner_table": owner_table if chunk_id is None else None,
+                        "owner_table": owner_table,
                         "owner_primitives": np.arange(total, dtype=np.uint32),
-                        "owner_resolver": obj.get("owner_resolver"),
+                        "owner_resolver": owner_resolver,
                     }
                 )
         return result

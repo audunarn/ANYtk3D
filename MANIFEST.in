@@ -3,6 +3,7 @@
 include LICENSE
 include README.md
 include pyproject.toml
+include run_gui.py
 recursive-include tests *.py
 
 prune build
