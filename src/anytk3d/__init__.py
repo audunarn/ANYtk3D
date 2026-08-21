@@ -57,19 +57,37 @@ from .picking import (
     SelectionOperation,
     SelectionTool,
 )
-from any3dview import SectionPlane
+from any3dview import (
+    ApplicationOwner,
+    DirtyGenerations,
+    MeshArrays,
+    MeshHandle,
+    ModelOwner,
+    PackedOwnerTable,
+    RetainedViewer,
+    SectionPlane,
+    ViewerCapabilities,
+    ViewerScheduler,
+)
 
-__version__ = "0.2.3"
+__version__ = "0.4.0"
 
 __all__ = [
+    "ApplicationOwner",
     "DEFAULT_COLOR_STOPS",
     "Camera3D",
+    "DirtyGenerations",
     "Light",
     "Mesh",
+    "MeshArrays",
+    "MeshHandle",
+    "ModelOwner",
+    "PackedOwnerTable",
     "Pick",
     "PickBinding",
     "PickOwner",
     "Point3D",
+    "RetainedViewer",
     "SelectionConfig",
     "SelectionDepth",
     "SelectionEvent",
@@ -80,6 +98,8 @@ __all__ = [
     "SelectionTool",
     "SectionPlane",
     "Tkinter3DCanvas",
+    "ViewerCapabilities",
+    "ViewerScheduler",
     "create_stiffened_cylinder_demo",
     "get_color_stops",
     "main",

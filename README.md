@@ -1,12 +1,12 @@
 # ANYtk3D
 
-Fast dependency-free 3D drawing on a Tkinter Canvas.
+Fast NumPy-backed 3D drawing on a Tkinter Canvas.
 
 ANYtk3D is the standalone 3D viewport extracted from
 [ANYstructure](https://github.com/audunarn/ANYstructure). It renders
 solids, stiffened plates, cylinders and arbitrary meshes directly on a
-`tkinter.Canvas` — no OpenGL, no matplotlib, only numpy and the standard
-library.
+`tkinter.Canvas` — no OpenGL, matplotlib or second GUI event loop. Shared
+geometry, retained-array and selection contracts come from ANY3dView.
 
 ## Features
 
@@ -30,6 +30,9 @@ library.
 - **Result fields and animation** — a batched `add_faces` call for meshes
   coloured per element, plus frame capture and playback that adapts its
   detail to the requested frame rate
+- **Retained FE arrays** — zero-copy `MeshArrays`, packed semantic owners,
+  displacement and scalar updates, active/selection masks, transforms and
+  local chunk replacement through stable `MeshHandle` objects
 - Camera orbit, zoom and pan; plate colour-coding by thickness (or any
   scalar) with a fixed legend; X/Y/Z axis overlay and optional rulers;
   animation caching and playback
@@ -62,6 +65,31 @@ canvas.add_grid(size_x=12, size_y=10)
 canvas.fit_to_scene()
 root.mainloop()
 ```
+
+### Retained arrays
+
+```python
+import numpy as np
+from anytk3d import MeshArrays
+
+handle = canvas.add_mesh_arrays(MeshArrays(
+    positions=np.asarray(nodes, np.float32),
+    triangles=np.asarray(connectivity, np.uint32),
+    triangle_to_element=np.asarray(triangle_to_element, np.uint32),
+    element_ids=np.asarray(element_ids, np.uint64),
+    element_scalars=np.asarray(stress, np.float32),
+))
+
+handle.update_displacements(next_displacements)
+handle.set_deformation_scale(20.0)
+handle.set_active_elements(active_mask)
+handle.set_selected_elements(selected_elements)
+```
+
+Compatible C-contiguous arrays are retained without copying and are treated as
+immutable while registered. Scalar-only changes reuse connectivity, geometry
+and packed ownership. Cross-thread producers can use
+`canvas.submit_update(handle.update_element_scalars, immutable_values)`.
 
 ### Shapes
 
@@ -290,8 +318,8 @@ pytest
 ```
 
 `ANY3dView` owns the backend-neutral geometry, camera, shading, clipping and
-selection types. ANYtk3D re-exports those objects, so existing 0.2 imports keep
-working unchanged.
+selection types. ANYtk3D re-exports those exact objects, so existing 0.2 and
+0.3 imports keep working unchanged.
 
 The regular suite stays headless. Tests that create real Tk windows are opt-in
 so a developer run cannot unexpectedly open GUI sessions:

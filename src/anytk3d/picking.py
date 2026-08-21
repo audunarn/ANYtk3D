@@ -332,15 +332,21 @@ class PickState:
 
         wanted = self.highlight_tags
         bindings = getattr(scene, "face_bindings", ())
+
+        def binding_at(index: int) -> Optional[PickBinding]:
+            resolver = getattr(scene, "face_binding", None)
+            if resolver is not None:
+                return resolver(index)
+            return bindings[index] if index < len(bindings) else None
+
         faces = frozenset(
             index
             for index, tag_string in enumerate(scene.tags)
             if (
                 tag_string and not wanted.isdisjoint(tag_string.split())
             ) or (
-                index < len(bindings)
-                and bindings[index] is not None
-                and any(owner.key in wanted for owner in bindings[index].owners)
+                (binding := binding_at(index)) is not None
+                and any(owner.key in wanted for owner in binding.owners)
             )
         )
         self._cache = (scene, self.generation, faces)
@@ -362,14 +368,20 @@ class PickState:
         if cached is not None and cached[0] is scene and cached[1] == key:
             return cached[2]
         bindings = getattr(scene, "face_bindings", ())
+
+        def binding_at(index: int) -> Optional[PickBinding]:
+            resolver = getattr(scene, "face_binding", None)
+            if resolver is not None:
+                return resolver(index)
+            return bindings[index] if index < len(bindings) else None
+
         faces = frozenset(
             index
             for index, tag_string in enumerate(scene.tags)
             if key in tag_string.split()
             or (
-                index < len(bindings)
-                and bindings[index] is not None
-                and any(owner.key == key for owner in bindings[index].owners)
+                (binding := binding_at(index)) is not None
+                and any(owner.key == key for owner in binding.owners)
             )
         )
         self._preselection_cache = (scene, key, faces)

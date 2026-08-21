@@ -57,6 +57,13 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 
 import numpy as np
 
+from any3dview import (
+    MeshArrays,
+    MeshHandle,
+    PackedOwnerTable,
+    ViewerCapabilities,
+    ViewerScheduler,
+)
 from any3dview.clipping import SectionPlane
 
 from . import shapes as shapes_module
@@ -114,6 +121,8 @@ __all__ = [
     "Camera3D",
     "Light",
     "Mesh",
+    "MeshArrays",
+    "MeshHandle",
     "PickBinding",
     "PickOwner",
     "Point3D",
@@ -127,6 +136,7 @@ __all__ = [
     "SelectionTool",
     "SectionPlane",
     "Tkinter3DCanvas",
+    "ViewerCapabilities",
     "create_stiffened_cylinder_demo",
     "get_color_stops",
     "reset_color_stops",
@@ -138,6 +148,19 @@ __all__ = [
     "populate_stiffened_cylinder",
     "populate_stiffened_plate",
 ]
+
+
+SOFTWARE_CAPABILITIES = ViewerCapabilities(
+    dynamic_arrays=True,
+    node_scalar_field=True,
+    element_scalar_field=True,
+    active_element_mask=True,
+    incremental_chunks=True,
+    through_selection=True,
+    clipping_planes=True,
+    transparency=True,
+    software_fallback=True,
+)
 
 
 # Canvas item tags used by the render pools.  Keeping them distinct lets the
@@ -280,6 +303,10 @@ class _CompiledScene:
         "fast_no_outline",
         "tags",
         "face_bindings",
+        "face_owner_table_slot",
+        "face_owner_primitive",
+        "face_owner_tables",
+        "face_owner_resolvers",
         "any_tags",
         "line_vertices",
         "line_color",
@@ -287,6 +314,10 @@ class _CompiledScene:
         "line_layer",
         "line_tags",
         "line_bindings",
+        "line_owner_table_slot",
+        "line_owner_primitive",
+        "line_owner_tables",
+        "line_owner_resolvers",
         "marker_points",
         "marker_colors",
         "marker_outlines",
@@ -294,6 +325,10 @@ class _CompiledScene:
         "marker_layers",
         "marker_tags",
         "marker_bindings",
+        "marker_owner_table_slot",
+        "marker_owner_primitive",
+        "marker_owner_tables",
+        "marker_owner_resolvers",
         "text_points",
         "text_layer",
         "text_content",
@@ -327,12 +362,20 @@ class _CompiledScene:
         self.fast_no_outline = np.empty(0, dtype=bool)
         self.tags: List[str] = []
         self.face_bindings: List[Optional[PickBinding]] = []
+        self.face_owner_table_slot = np.empty(0, dtype=np.int32)
+        self.face_owner_primitive = np.empty(0, dtype=np.uint32)
+        self.face_owner_tables: List[PackedOwnerTable] = []
+        self.face_owner_resolvers: List[Optional[Callable[..., object]]] = []
         self.any_tags = False
         self.line_vertices = np.empty((0, 3), dtype=np.float32)
         self.line_color: List[str] = []
         self.line_width: List[int] = []
         self.line_tags: List[str] = []
         self.line_bindings: List[Optional[PickBinding]] = []
+        self.line_owner_table_slot = np.empty(0, dtype=np.int32)
+        self.line_owner_primitive = np.empty(0, dtype=np.uint32)
+        self.line_owner_tables: List[PackedOwnerTable] = []
+        self.line_owner_resolvers: List[Optional[Callable[..., object]]] = []
         self.line_layer = np.empty(0, dtype=np.float32)
         self.marker_points = np.empty((0, 3), dtype=np.float32)
         self.marker_colors: List[str] = []
@@ -341,6 +384,10 @@ class _CompiledScene:
         self.marker_layers = np.empty(0, dtype=np.float32)
         self.marker_tags: List[str] = []
         self.marker_bindings: List[Optional[PickBinding]] = []
+        self.marker_owner_table_slot = np.empty(0, dtype=np.int32)
+        self.marker_owner_primitive = np.empty(0, dtype=np.uint32)
+        self.marker_owner_tables: List[PackedOwnerTable] = []
+        self.marker_owner_resolvers: List[Optional[Callable[..., object]]] = []
         self.text_points = np.empty((0, 3), dtype=np.float32)
         self.text_layer = np.empty(0, dtype=np.float32)
         self.text_content: List[Tuple[str, str, Any, str]] = []
@@ -349,6 +396,92 @@ class _CompiledScene:
     @property
     def face_total(self) -> int:
         return len(self.face_start)
+
+    def face_binding(self, face: int) -> Optional[PickBinding]:
+        """Resolve a packed binding only when selection or highlighting needs it."""
+
+        if face < len(self.face_bindings) and self.face_bindings[face] is not None:
+            return self.face_bindings[face]
+        if face >= len(self.face_owner_table_slot):
+            return None
+        table_slot = int(self.face_owner_table_slot[face])
+        if table_slot < 0:
+            return None
+        owners = self.face_owner_tables[table_slot].owners_for(
+            "triangle",
+            int(self.face_owner_primitive[face]),
+            self.face_owner_resolvers[table_slot],
+        )
+        converted: List[PickOwner] = []
+        for owner in owners:
+            if isinstance(owner, PickOwner):
+                converted.append(owner)
+            else:
+                converted.append(
+                    PickOwner(
+                        f"{owner.model_id}:{owner.kind}:{owner.id}",
+                        f"geometry.{owner.kind}",
+                        owner.priority,
+                        owner,
+                    )
+                )
+        return PickBinding(tuple(converted)) if converted else None
+
+    @staticmethod
+    def _packed_binding(
+        primitive: int,
+        primitive_kind: str,
+        slots: np.ndarray,
+        primitives: np.ndarray,
+        tables: List[PackedOwnerTable],
+        resolvers: List[Optional[Callable[..., object]]],
+    ) -> Optional[PickBinding]:
+        if primitive >= len(slots):
+            return None
+        table_slot = int(slots[primitive])
+        if table_slot < 0:
+            return None
+        owners = tables[table_slot].owners_for(
+            primitive_kind,
+            int(primitives[primitive]),
+            resolvers[table_slot],
+        )
+        converted = [
+            owner
+            if isinstance(owner, PickOwner)
+            else PickOwner(
+                f"{owner.model_id}:{owner.kind}:{owner.id}",
+                f"geometry.{owner.kind}",
+                owner.priority,
+                owner,
+            )
+            for owner in owners
+        ]
+        return PickBinding(tuple(converted)) if converted else None
+
+    def line_binding(self, line: int) -> Optional[PickBinding]:
+        if line < len(self.line_bindings) and self.line_bindings[line] is not None:
+            return self.line_bindings[line]
+        return self._packed_binding(
+            line,
+            "line",
+            self.line_owner_table_slot,
+            self.line_owner_primitive,
+            self.line_owner_tables,
+            self.line_owner_resolvers,
+        )
+
+    def marker_binding(self, marker: int) -> Optional[PickBinding]:
+        if marker < len(self.marker_bindings) and self.marker_bindings[marker] is not None:
+            return self.marker_bindings[marker]
+        return self._packed_binding(
+            marker,
+            "point",
+            self.marker_owner_table_slot,
+            self.marker_owner_primitive,
+            self.marker_owner_tables,
+            self.marker_owner_resolvers,
+        )
 
 
 class Tkinter3DCanvas(tk.Frame):
@@ -385,6 +518,7 @@ class Tkinter3DCanvas(tk.Frame):
         self._shading_enabled = bool(shading)
         self._occlude_lines = True
         self._section_plane: Optional[SectionPlane] = None
+        self._backend_diagnostics: Tuple[str, ...] = ()
 
         canvas_kwargs.setdefault("highlightthickness", 0)
         canvas_kwargs.setdefault("borderwidth", 0)
@@ -500,7 +634,27 @@ class Tkinter3DCanvas(tk.Frame):
         self.canvas.bind("<FocusOut>", self._on_selection_focus_out, add="+")
         self.set_interaction_profile(interaction_profile)
 
+        self._update_scheduler = ViewerScheduler()
+        self._update_poll_id: Optional[str] = None
+        self._poll_updates()
         self.after_idle(self._request_redraw)
+
+    def submit_update(
+        self,
+        callback: Callable[..., Any],
+        /,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        """Queue an immutable update payload for the owning Tk thread."""
+
+        self._update_scheduler.submit(callback, *args, **kwargs)
+
+    def _poll_updates(self) -> None:
+        completed = self._update_scheduler.drain()
+        if completed:
+            self._request_redraw()
+        self._update_poll_id = self.after(16, self._poll_updates)
 
     # ------------------------------------------------------------------
     # Lighting and render options
@@ -564,6 +718,18 @@ class Tkinter3DCanvas(tk.Frame):
             self._occlude_lines = enabled
             self._invalidate_geometry_cache()
             self._request_redraw()
+
+    @property
+    def capabilities(self) -> ViewerCapabilities:
+        """Read-only features implemented by the software backend."""
+
+        return SOFTWARE_CAPABILITIES
+
+    @property
+    def backend_diagnostics(self) -> Tuple[str, ...]:
+        """Diagnostics retained when ``create_viewer(auto)`` fell back here."""
+
+        return self._backend_diagnostics
 
     @property
     def section_plane(self) -> Optional[SectionPlane]:
@@ -1864,11 +2030,7 @@ class Tkinter3DCanvas(tk.Frame):
                     shape=shape,
                     points=points_2d,
                     depths=depths,
-                    binding=(
-                        scene.face_bindings[face]
-                        if face < len(scene.face_bindings)
-                        else fallback_binding(scene.tags[face])
-                    ),
+                    binding=scene.face_binding(face) or fallback_binding(scene.tags[face]),
                     layer=float(scene.face_layer[face]),
                     radius=radius,
                 )
@@ -1909,11 +2071,8 @@ class Tkinter3DCanvas(tk.Frame):
                         shape="segment",
                         points=points_2d,
                         depths=depths,
-                        binding=(
-                            scene.line_bindings[line]
-                            if line < len(scene.line_bindings)
-                            else fallback_binding(scene.line_tags[line])
-                        ),
+                        binding=scene.line_binding(line)
+                        or fallback_binding(scene.line_tags[line]),
                         layer=float(scene.line_layer[line]),
                         radius=max(1.5, 0.5 * float(scene.line_width[line])),
                     )
@@ -1944,7 +2103,7 @@ class Tkinter3DCanvas(tk.Frame):
                         shape="point",
                         points=((float(marker_x[marker]), float(marker_y[marker])),),
                         depths=(float(marker_camera[marker, 2]),),
-                        binding=scene.marker_bindings[marker],
+                        binding=scene.marker_binding(marker),
                         layer=float(scene.marker_layers[marker]),
                         radius=0.5 * float(scene.marker_sizes[marker]),
                     )
@@ -2195,6 +2354,14 @@ class Tkinter3DCanvas(tk.Frame):
         self._text_state.clear()
 
     def clear(self, keep_canvas: bool = False) -> None:
+        retained = [
+            obj.get("handle")
+            for obj in self.objects
+            if obj.get("type") == "mesh_arrays"
+        ]
+        for handle in retained:
+            if isinstance(handle, MeshHandle):
+                handle.remove()
         self.objects.clear()
         self._explicit_opaque_cylinder_occluders.clear()
         if hasattr(self, "_hover_key"):
@@ -2204,6 +2371,19 @@ class Tkinter3DCanvas(tk.Frame):
         self._invalidate_geometry_cache()
         if not keep_canvas:
             self._clear_canvas_only()
+
+    def destroy(self) -> None:
+        scheduler = getattr(self, "_update_scheduler", None)
+        if scheduler is not None:
+            poll_id = getattr(self, "_update_poll_id", None)
+            if poll_id is not None:
+                try:
+                    self.after_cancel(poll_id)
+                except tk.TclError:
+                    pass
+                self._update_poll_id = None
+            scheduler.close()
+        super().destroy()
 
     def _get_ruler_primitives(self) -> List[Dict[str, Any]]:
         bounds = self._scene_bounds()
@@ -2428,11 +2608,21 @@ class Tkinter3DCanvas(tk.Frame):
                 face_center.clear()
 
         line_vertices: List[Tuple[float, float, float]] = []
+        line_vertex_blocks: List[np.ndarray] = []
         line_layer: List[float] = []
         marker_points: List[Tuple[float, float, float]] = []
         marker_layer: List[float] = []
         text_points: List[Tuple[float, float, float]] = []
         text_layer: List[float] = []
+        packed_face_spans: List[
+            Tuple[int, int, PackedOwnerTable, np.ndarray, Optional[Callable[..., object]]]
+        ] = []
+        packed_line_spans: List[
+            Tuple[int, int, PackedOwnerTable, np.ndarray, Optional[Callable[..., object]]]
+        ] = []
+        packed_marker_spans: List[
+            Tuple[int, int, PackedOwnerTable, np.ndarray, Optional[Callable[..., object]]]
+        ] = []
 
         occlude_lines = self._occlude_lines
 
@@ -2460,6 +2650,24 @@ class Tkinter3DCanvas(tk.Frame):
                     primitive.get("bindings")
                     or _coerce_pick_bindings(None, total, tags)
                 )
+                owner_table = primitive.get("owner_table")
+                if owner_table is not None:
+                    owner_primitives = np.asarray(
+                        primitive.get("owner_primitives", np.arange(total)),
+                        dtype=np.uint32,
+                    )
+                    if len(owner_primitives) != total:
+                        raise ValueError("owner_primitives must have one value per marker")
+                    packed_marker_spans.append(
+                        (
+                            len(scene.marker_bindings) - total,
+                            total,
+                            owner_table,
+                            owner_primitives,
+                            primitive.get("owner_resolver"),
+                        )
+                    )
+                    scene.any_tags = True
                 if tags:
                     scene.any_tags = True
                 continue
@@ -2473,9 +2681,12 @@ class Tkinter3DCanvas(tk.Frame):
                 offsets = np.zeros(total, dtype=np.int64)
                 np.cumsum(counts[:-1], out=offsets[1:])
 
-                centers, normals = self._batch_centers_and_normals(
-                    vertices, counts, offsets
-                )
+                centers = primitive.get("centers")
+                normals = primitive.get("normals")
+                if centers is None or normals is None:
+                    centers, normals = self._batch_centers_and_normals(
+                        vertices, counts, offsets
+                    )
                 face_center_blocks.append(centers)
                 face_normal_blocks.append(normals)
                 face_start.extend((offsets + next_vertex).tolist())
@@ -2506,6 +2717,24 @@ class Tkinter3DCanvas(tk.Frame):
                     primitive.get("bindings")
                     or _coerce_pick_bindings(None, total, tags)
                 )
+                owner_table = primitive.get("owner_table")
+                if owner_table is not None:
+                    owner_primitives = np.asarray(
+                        primitive.get("owner_primitives", np.arange(total)),
+                        dtype=np.uint32,
+                    )
+                    if len(owner_primitives) != total:
+                        raise ValueError("owner_primitives must have one value per face")
+                    packed_face_spans.append(
+                        (
+                            len(face_start) - total,
+                            total,
+                            owner_table,
+                            owner_primitives,
+                            primitive.get("owner_resolver"),
+                        )
+                    )
+                    scene.any_tags = True
                 if tags:
                     scene.any_tags = True
 
@@ -2513,6 +2742,43 @@ class Tkinter3DCanvas(tk.Frame):
                 opaque.extend([not front_stipple] * total)
                 scene.stipple_front.extend([front_stipple] * total)
                 scene.stipple_back.extend([back_stipple] * total)
+                continue
+
+            if kind == "lines":
+                vertices = np.asarray(primitive.get("vertices"), dtype=np.float32)
+                total = int(primitive.get("total", len(vertices) // 2))
+                if vertices.shape != (2 * total, 3):
+                    raise ValueError("line batch must contain two vertices per line")
+                if line_vertices:
+                    line_vertex_blocks.append(np.asarray(line_vertices, dtype=np.float32))
+                    line_vertices.clear()
+                line_vertex_blocks.append(vertices)
+                scene.line_color.extend([primitive.get("color", "black")] * total)
+                scene.line_width.extend([primitive.get("width", 1)] * total)
+                tags = primitive.get("tags") or ""
+                scene.line_tags.extend([tags] * total)
+                scene.line_bindings.extend([None] * total)
+                owner_table = primitive.get("owner_table")
+                if owner_table is not None:
+                    owner_primitives = np.asarray(
+                        primitive.get("owner_primitives", np.arange(total)),
+                        dtype=np.uint32,
+                    )
+                    if len(owner_primitives) != total:
+                        raise ValueError("owner_primitives must have one value per line")
+                    packed_line_spans.append(
+                        (
+                            len(scene.line_bindings) - total,
+                            total,
+                            owner_table,
+                            owner_primitives,
+                            primitive.get("owner_resolver"),
+                        )
+                    )
+                    scene.any_tags = True
+                line_layer.extend([float(primitive.get("layer", 30))] * total)
+                if tags:
+                    scene.any_tags = True
                 continue
 
             if kind == "text":
@@ -2661,12 +2927,84 @@ class Tkinter3DCanvas(tk.Frame):
         # outlines are intentionally excluded from the hidden-surface filter.
         scene.face_occludable = (scene.face_layer >= 10.0) & (scene.face_layer < 30.0)
 
+        scene.face_owner_table_slot = np.full(count, -1, dtype=np.int32)
+        scene.face_owner_primitive = np.zeros(count, dtype=np.uint32)
+        for start, total, table, primitives, resolver in packed_face_spans:
+            table_slot = next(
+                (
+                    index
+                    for index, existing in enumerate(scene.face_owner_tables)
+                    if existing is table
+                ),
+                -1,
+            )
+            if table_slot < 0:
+                table_slot = len(scene.face_owner_tables)
+                scene.face_owner_tables.append(table)
+                scene.face_owner_resolvers.append(resolver)
+            scene.face_owner_table_slot[start : start + total] = table_slot
+            scene.face_owner_primitive[start : start + total] = primitives
+
+        def install_packed_spans(
+            total: int,
+            spans: List[
+                Tuple[
+                    int,
+                    int,
+                    PackedOwnerTable,
+                    np.ndarray,
+                    Optional[Callable[..., object]],
+                ]
+            ],
+            tables: List[PackedOwnerTable],
+            resolvers: List[Optional[Callable[..., object]]],
+        ) -> Tuple[np.ndarray, np.ndarray]:
+            slots = np.full(total, -1, dtype=np.int32)
+            primitives = np.zeros(total, dtype=np.uint32)
+            for start, span_total, table, source_primitives, resolver in spans:
+                table_slot = next(
+                    (
+                        index
+                        for index, existing in enumerate(tables)
+                        if existing is table
+                    ),
+                    -1,
+                )
+                if table_slot < 0:
+                    table_slot = len(tables)
+                    tables.append(table)
+                    resolvers.append(resolver)
+                slots[start : start + span_total] = table_slot
+                primitives[start : start + span_total] = source_primitives
+            return slots, primitives
+
+        (
+            scene.line_owner_table_slot,
+            scene.line_owner_primitive,
+        ) = install_packed_spans(
+            len(scene.line_bindings),
+            packed_line_spans,
+            scene.line_owner_tables,
+            scene.line_owner_resolvers,
+        )
+        (
+            scene.marker_owner_table_slot,
+            scene.marker_owner_primitive,
+        ) = install_packed_spans(
+            len(scene.marker_bindings),
+            packed_marker_spans,
+            scene.marker_owner_tables,
+            scene.marker_owner_resolvers,
+        )
+
         scene.table_front = [shade_table(color) for color in scene.base_front]
         scene.table_back = [shade_table(color) for color in scene.base_back]
 
+        if line_vertices:
+            line_vertex_blocks.append(np.asarray(line_vertices, dtype=np.float32))
         scene.line_vertices = (
-            np.asarray(line_vertices, dtype=np.float32)
-            if line_vertices
+            np.concatenate(line_vertex_blocks)
+            if line_vertex_blocks
             else np.empty((0, 3), dtype=np.float32)
         )
         scene.line_layer = np.asarray(line_layer, dtype=np.float32) if line_layer else np.empty(0, np.float32)
@@ -3429,7 +3767,7 @@ class Tkinter3DCanvas(tk.Frame):
             call((widget, "coords", item, round(float(x0[projected_line])), round(float(y0[projected_line])),
                   round(float(x1[projected_line])), round(float(y1[projected_line]))))
             tag = line_tags[line] if any_line_tags else ""
-            binding = line_bindings[line] if line < len(line_bindings) else None
+            binding = scene.line_binding(line)
             keys = () if binding is None else tuple(owner.key for owner in binding.owners)
             is_selected = bool(selected.intersection(keys)) or tag in selected
             is_preselected = bool(
@@ -3512,7 +3850,7 @@ class Tkinter3DCanvas(tk.Frame):
         selected = self._pick.highlight_tags
         preselected = self._pick.preselection_key
         for slot, marker in enumerate(index.tolist()):
-            binding = scene.marker_bindings[marker]
+            binding = scene.marker_binding(marker)
             keys = () if binding is None else tuple(owner.key for owner in binding.owners)
             is_selected = bool(selected.intersection(keys))
             is_preselected = bool(preselected and preselected in keys and not is_selected)
@@ -3832,6 +4170,8 @@ class Tkinter3DCanvas(tk.Frame):
             return [dict(obj, kind="markers")]
         if object_type == "mesh":
             return self._mesh_primitives(obj, object_index)
+        if object_type == "mesh_arrays":
+            return self._retained_mesh_primitives(obj)
         if object_type == "cylinder":
             return self._cylinder_primitives(obj, quality)
         if object_type == "stiffener":
@@ -3839,6 +4179,184 @@ class Tkinter3DCanvas(tk.Frame):
                 return self._ring_stiffener_primitives(obj, quality)
             return self._longitudinal_stiffener_primitives(obj, quality)
         return []
+
+    @staticmethod
+    def _retained_colors(
+        mesh: MeshArrays,
+        face_indices: np.ndarray,
+        obj: Dict[str, Any],
+    ) -> List[str]:
+        """Resolve retained result values without rebuilding mesh topology."""
+
+        explicit = obj.get("face_colors")
+        if explicit is not None:
+            values = list(explicit)
+            if len(values) == mesh.triangle_count:
+                return [str(values[int(index)]) for index in face_indices]
+            if len(values) == mesh.element_count:
+                mapping = (
+                    mesh.triangle_to_element
+                    if mesh.triangle_to_element is not None
+                    else np.arange(mesh.triangle_count, dtype=np.uint32)
+                )
+                return [str(values[int(mapping[index])]) for index in face_indices]
+            raise ValueError("face_colors must match triangle or element count")
+
+        scalar_values: Optional[np.ndarray]
+        if mesh.element_scalars is not None:
+            mapping = (
+                mesh.triangle_to_element
+                if mesh.triangle_to_element is not None
+                else np.arange(mesh.triangle_count, dtype=np.uint32)
+            )
+            scalar_values = mesh.element_scalars[mapping[face_indices]]
+        elif mesh.node_scalars is not None:
+            scalar_values = np.mean(mesh.node_scalars[mesh.triangles[face_indices]], axis=1)
+        else:
+            return [str(obj.get("color", "#9aa7b4"))] * len(face_indices)
+
+        finite = np.isfinite(scalar_values)
+        configured = obj.get("scalar_range")
+        if configured is not None:
+            minimum, maximum = float(configured[0]), float(configured[1])
+        elif np.any(finite):
+            minimum = float(np.min(scalar_values[finite]))
+            maximum = float(np.max(scalar_values[finite]))
+        else:
+            minimum, maximum = 0.0, 1.0
+        if not math.isfinite(minimum) or not math.isfinite(maximum):
+            raise ValueError("scalar_range must contain finite values")
+        if maximum < minimum:
+            minimum, maximum = maximum, minimum
+        palette = [
+            _interpolate_thickness_color(
+                minimum + (maximum - minimum) * index / 255.0,
+                minimum,
+                maximum,
+            )
+            for index in range(256)
+        ]
+        span = max(_EPS, maximum - minimum)
+        levels = np.clip(
+            np.rint((scalar_values - minimum) * 255.0 / span), 0, 255
+        ).astype(np.uint8)
+        invalid = str(obj.get("invalid_color", "#808080"))
+        return [palette[int(level)] if valid else invalid for level, valid in zip(levels, finite)]
+
+    def _retained_mesh_primitives(self, obj: Dict[str, Any]) -> List[Dict[str, Any]]:
+        handle = obj["handle"]
+        if handle.removed or not handle.visible:
+            return []
+        sources = [(None, handle.mesh), *handle.chunks]
+        result: List[Dict[str, Any]] = []
+        geometry_cache = obj.setdefault("_array_geometry_cache", {})
+        owner_table = obj.get("owners")
+
+        for chunk_id, mesh in sources:
+            mapping = (
+                mesh.triangle_to_element
+                if mesh.triangle_to_element is not None
+                else np.arange(mesh.triangle_count, dtype=np.uint32)
+            )
+            if mesh.active_elements is None:
+                face_indices = np.arange(mesh.triangle_count, dtype=np.uint32)
+            else:
+                face_indices = np.flatnonzero(mesh.active_elements[mapping]).astype(np.uint32)
+
+            cache_key = (
+                chunk_id,
+                id(mesh.positions),
+                id(mesh.triangles),
+                id(mesh.displacements),
+                id(mesh.active_elements),
+                handle.deformation_scale,
+                handle.generations.transform,
+            )
+            cached = geometry_cache.get(cache_key)
+            if cached is None:
+                positions = mesh.positions
+                if mesh.displacements is not None and handle.deformation_scale:
+                    positions = positions + handle.deformation_scale * mesh.displacements
+                transform = handle.transform
+                positions = (
+                    positions @ transform[:3, :3].T + transform[:3, 3]
+                ).astype(np.float32, copy=False)
+                triangles = mesh.triangles[face_indices]
+                triangle_points = positions[triangles]
+                vertices = np.ascontiguousarray(triangle_points.reshape((-1, 3)))
+                counts = np.full(len(triangles), 3, dtype=np.int64)
+                centers = np.mean(triangle_points, axis=1, dtype=np.float64).astype(np.float32)
+                normals = np.cross(
+                    triangle_points[:, 1] - triangle_points[:, 0],
+                    triangle_points[:, 2] - triangle_points[:, 0],
+                )
+                lengths = np.linalg.norm(normals, axis=1)
+                normals /= np.maximum(lengths, _EPS)[:, None]
+                normals[lengths <= _EPS] = 0.0
+                cached = (positions, vertices, counts, centers, normals.astype(np.float32))
+                geometry_cache[cache_key] = cached
+            positions, vertices, counts, centers, normals = cached
+
+            if len(face_indices):
+                colors = self._retained_colors(mesh, face_indices, obj)
+                back = obj.get("back_color")
+                result.append(
+                    {
+                        "kind": "faces",
+                        "vertices": vertices,
+                        "counts": counts,
+                        "centers": centers,
+                        "normals": normals,
+                        "colors": colors,
+                        "back_colors": [str(back)] * len(colors) if back else None,
+                        "outline": obj.get("outline", ""),
+                        "width": obj.get("width", 1),
+                        "layer": int(obj.get("layer", 5)),
+                        "cull_backface": bool(obj.get("cull_backface", True)),
+                        "opacity": float(obj.get("opacity", 1.0)),
+                        "stipple": obj.get("stipple", ""),
+                        "tags": obj.get("tags", ""),
+                        "lit": bool(obj.get("lit", True)),
+                        "two_sided_shell": bool(obj.get("two_sided_shell", False)),
+                        "owner_table": owner_table if chunk_id is None else None,
+                        "owner_primitives": face_indices,
+                        "owner_resolver": obj.get("owner_resolver"),
+                    }
+                )
+
+            if mesh.lines is not None and len(mesh.lines):
+                line_vertices = np.ascontiguousarray(positions[mesh.lines].reshape((-1, 3)))
+                result.append(
+                    {
+                        "kind": "lines",
+                        "vertices": line_vertices,
+                        "total": len(mesh.lines),
+                        "color": str(obj.get("line_color") or obj.get("outline") or "black"),
+                        "width": int(obj.get("line_width") or obj.get("width", 1)),
+                        "layer": int(obj.get("line_layer", 30)),
+                        "tags": obj.get("tags", ""),
+                        "owner_table": owner_table if chunk_id is None else None,
+                        "owner_primitives": np.arange(len(mesh.lines), dtype=np.uint32),
+                        "owner_resolver": obj.get("owner_resolver"),
+                    }
+                )
+            if mesh.point_indices is not None and len(mesh.point_indices):
+                total = len(mesh.point_indices)
+                result.append(
+                    {
+                        "kind": "markers",
+                        "points": positions[mesh.point_indices],
+                        "colors": [str(obj.get("point_color", "#2563eb"))] * total,
+                        "outlines": [str(obj.get("point_outline", ""))] * total,
+                        "sizes": [int(obj.get("point_size", 6))] * total,
+                        "layer": int(obj.get("point_layer", 32)),
+                        "tags": obj.get("tags", ""),
+                        "owner_table": owner_table if chunk_id is None else None,
+                        "owner_primitives": np.arange(total, dtype=np.uint32),
+                        "owner_resolver": obj.get("owner_resolver"),
+                    }
+                )
+        return result
 
     def _mesh_primitives(
         self,
@@ -4624,6 +5142,92 @@ class Tkinter3DCanvas(tk.Frame):
         self.objects.append(obj)
         self._invalidate_geometry_cache()
         self._request_redraw()
+
+    def _retained_mesh_changed(self, handle: MeshHandle, change: str) -> None:
+        matching = [obj for obj in self.objects if obj.get("handle") is handle]
+        if change == "remove":
+            self.objects[:] = [obj for obj in self.objects if obj.get("handle") is not handle]
+        elif change in {"topology", "position", "displacement", "active", "transform"}:
+            for obj in matching:
+                obj.pop("_array_geometry_cache", None)
+        self._invalidate_geometry_cache()
+        self._request_redraw()
+
+    def add_mesh_arrays(
+        self,
+        mesh: MeshArrays,
+        *,
+        color: str = "#9aa7b4",
+        outline: str = "",
+        width: int = 1,
+        layer: int = 5,
+        cull_backface: bool = True,
+        opacity: float = 1.0,
+        stipple: str = "",
+        back_color: str = "",
+        tags: str = "",
+        lit: bool = True,
+        two_sided_shell: bool = False,
+        face_colors: Optional[Sequence[str]] = None,
+        scalar_range: Optional[Tuple[float, float]] = None,
+        invalid_color: str = "#808080",
+        owners: Optional[PackedOwnerTable] = None,
+        owner_resolver: Optional[Callable[..., object]] = None,
+        line_color: Optional[str] = None,
+        line_width: Optional[int] = None,
+        point_color: str = "#2563eb",
+        point_outline: str = "",
+        point_size: int = 6,
+    ) -> MeshHandle:
+        """Add an indexed retained mesh without per-element scene objects."""
+
+        if not isinstance(mesh, MeshArrays):
+            raise TypeError("mesh must be MeshArrays")
+        if owners is not None:
+            if not isinstance(owners, PackedOwnerTable):
+                raise TypeError("owners must be a PackedOwnerTable")
+            mapped_triangles = len(owners.triangle_offsets) - 1
+            if mapped_triangles not in (0, mesh.triangle_count):
+                raise ValueError("triangle owner mappings must match triangle count")
+        if scalar_range is not None:
+            scalar_range = (float(scalar_range[0]), float(scalar_range[1]))
+        handle = MeshHandle(mesh, on_change=self._retained_mesh_changed)
+        self._add_object(
+            {
+                "type": "mesh_arrays",
+                "handle": handle,
+                "color": str(color),
+                "outline": str(outline),
+                "width": int(width),
+                "layer": int(layer),
+                "cull_backface": bool(cull_backface),
+                "opacity": float(opacity),
+                "stipple": str(stipple),
+                "back_color": str(back_color),
+                "tags": str(tags),
+                "lit": bool(lit),
+                "two_sided_shell": bool(two_sided_shell),
+                "face_colors": face_colors,
+                "scalar_range": scalar_range,
+                "invalid_color": str(invalid_color),
+                "owners": owners,
+                "owner_resolver": owner_resolver,
+                "line_color": line_color,
+                "line_width": line_width,
+                "point_color": str(point_color),
+                "point_outline": str(point_outline),
+                "point_size": max(1, int(point_size)),
+            }
+        )
+        return handle
+
+    def add_layer(self, layer: Any) -> Any:
+        """Attach a renderer-neutral layer such as ``GeometryLayer``."""
+
+        attach = getattr(layer, "attach", None)
+        if not callable(attach):
+            raise TypeError("layer must provide attach(viewer)")
+        return attach(self)
 
     def add_line(
         self,
@@ -5535,6 +6139,21 @@ class Tkinter3DCanvas(tk.Frame):
                     zs = [point.z for point in mesh_points]
                     points.append(Point3D(min(xs), min(ys), min(zs)))
                     points.append(Point3D(max(xs), max(ys), max(zs)))
+            elif object_type == "mesh_arrays":
+                handle = obj.get("handle")
+                if isinstance(handle, MeshHandle) and not handle.removed and handle.visible:
+                    for _chunk_id, mesh in [(None, handle.mesh), *handle.chunks]:
+                        positions = mesh.positions
+                        if mesh.displacements is not None and handle.deformation_scale:
+                            positions = positions + handle.deformation_scale * mesh.displacements
+                        if not len(positions):
+                            continue
+                        transform = handle.transform
+                        positions = positions @ transform[:3, :3].T + transform[:3, 3]
+                        low = positions.min(axis=0)
+                        high = positions.max(axis=0)
+                        points.append(Point3D(*low))
+                        points.append(Point3D(*high))
             elif object_type == "faces":
                 vertices = obj.get("vertices")
                 if vertices is not None and len(vertices):
