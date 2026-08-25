@@ -68,10 +68,20 @@ from any3dview import (
     SectionPlane,
     ViewerCapabilities,
     ViewerScheduler,
+    SemanticRef,
+    VisibilityState,
+    ViewerCommand,
+    ViewerCommandController,
+    ViewerCommandDescriptor,
+    ViewerCommandPriority,
+    ViewerCommandResult,
+    ViewerObservation,
+    VIEWER_COMMANDS,
+    viewer_command_manifest,
 )
 from any3dview.contracts import ViewerBackend, ViewerState
 
-__version__ = "0.5.1"
+__version__ = "0.5.2"
 
 __all__ = [
     "ApplicationOwner",
@@ -103,6 +113,16 @@ __all__ = [
     "ViewerBackend",
     "ViewerScheduler",
     "ViewerState",
+    "SemanticRef",
+    "VisibilityState",
+    "ViewerCommand",
+    "ViewerCommandController",
+    "ViewerCommandDescriptor",
+    "ViewerCommandPriority",
+    "ViewerCommandResult",
+    "ViewerObservation",
+    "VIEWER_COMMANDS",
+    "viewer_command_manifest",
     "create_stiffened_cylinder_demo",
     "get_color_stops",
     "main",

@@ -67,6 +67,7 @@ from any3dview import (
 )
 from any3dview.clipping import SectionPlane
 from any3dview.contracts import ViewerBackend, ViewerState
+from any3dview.semantic import SemanticRef, VisibilityState, semantic_refs
 
 from . import shapes as shapes_module
 from . import stipple as stipple_module
@@ -177,6 +178,10 @@ SOFTWARE_CAPABILITIES = ViewerCapabilities(
     image_capture=importlib.util.find_spec("PIL") is not None,
     line_occlusion=True,
     stippled_transparency=True,
+    semantic_selection=True,
+    semantic_visibility=True,
+    viewer_commands=True,
+    command_history=True,
 )
 
 
@@ -622,6 +627,8 @@ class Tkinter3DCanvas(tk.Frame):
         # leaves orbit on RMB.  The legacy profile keeps LMB pan + click-pick.
         self._interaction_profile = ""
         self._selection_config = SelectionConfig()
+        self._semantic_selection: tuple[SemanticRef, ...] = ()
+        self._visibility_state = VisibilityState()
         self._selection_callback: Optional[Callable[[SelectionEvent], None]] = None
         self._selection_hover_callback: Optional[
             Callable[[Optional[SelectionHit]], None]
@@ -813,6 +820,8 @@ class Tkinter3DCanvas(tk.Frame):
             axis_indicator=bool(self._show_axis_indicator),
             axis_ruler=bool(self.show_axis_ruler),
             interaction_profile=str(self._interaction_profile),
+            semantic_selection=getattr(self, "_semantic_selection", ()),
+            visibility=getattr(self, "_visibility_state", VisibilityState()),
         )
 
     def apply_view_state(self, state: ViewerState, *, redraw: bool = True) -> None:
@@ -852,6 +861,8 @@ class Tkinter3DCanvas(tk.Frame):
         self._show_axis_indicator = bool(state.axis_indicator)
         self.show_axis_ruler = bool(state.axis_ruler)
         self.set_interaction_profile(interaction_profile)
+        self._semantic_selection = semantic_refs(state.semantic_selection)
+        self._visibility_state = state.visibility
         plane = state.section_plane
         self._section_plane = (
             None
@@ -1466,6 +1477,29 @@ class Tkinter3DCanvas(tk.Frame):
     @property
     def selection_config(self) -> SelectionConfig:
         return self._selection_config
+
+    @property
+    def semantic_selection(self) -> tuple[SemanticRef, ...]:
+        return getattr(self, "_semantic_selection", ())
+
+    @property
+    def visibility_state(self) -> VisibilityState:
+        return getattr(self, "_visibility_state", VisibilityState())
+
+    def set_semantic_selection(self, values: Sequence[SemanticRef]) -> None:
+        self._semantic_selection = semantic_refs(values)
+        self._selection_index = None
+        self._selection_index_key = None
+        self._request_redraw()
+
+    def set_visibility_state(self, state: VisibilityState) -> None:
+        if not isinstance(state, VisibilityState):
+            raise TypeError("state must be VisibilityState")
+        self._visibility_state = state
+        self._selection_index = None
+        self._selection_index_key = None
+        self._invalidate_geometry_cache()
+        self._request_redraw()
 
     def update_selection_config(self, **changes: Any) -> SelectionConfig:
         """Replace selected fields of the immutable selection configuration."""
@@ -2881,6 +2915,14 @@ class Tkinter3DCanvas(tk.Frame):
 
         for primitive in primitives:
             kind = primitive.get("kind")
+            binding = primitive.get("binding")
+            visibility_state = getattr(self, "_visibility_state", VisibilityState())
+            if (
+                not visibility_state.is_default
+                and binding is not None
+                and not visibility_state.accepts(binding.owners)
+            ):
+                continue
 
             if kind == "markers":
                 points = primitive.get("points", ())
@@ -4541,6 +4583,7 @@ class Tkinter3DCanvas(tk.Frame):
         ]
         result: List[Dict[str, Any]] = []
         geometry_cache = obj.setdefault("_array_geometry_cache", {})
+        visibility_state = getattr(self, "_visibility_state", VisibilityState())
 
         for chunk_id, mesh, owner_table, owner_resolver in sources:
             mapping = (
@@ -4552,6 +4595,16 @@ class Tkinter3DCanvas(tk.Frame):
                 face_indices = np.arange(mesh.triangle_count, dtype=np.uint32)
             else:
                 face_indices = np.flatnonzero(mesh.active_elements[mapping]).astype(np.uint32)
+            if owner_table is not None and not visibility_state.is_default:
+                face_indices = np.asarray(
+                    [
+                        index for index in face_indices
+                        if visibility_state.accepts(
+                            owner_table.owners_for("triangle", int(index), owner_resolver)
+                        )
+                    ],
+                    dtype=np.uint32,
+                )
 
             cache_key = (
                 chunk_id,
@@ -4561,6 +4614,7 @@ class Tkinter3DCanvas(tk.Frame):
                 id(mesh.active_elements),
                 handle.deformation_scale,
                 handle.generations.transform,
+                visibility_state,
             )
             cached = geometry_cache.get(cache_key)
             if cached is None:
@@ -4623,34 +4677,56 @@ class Tkinter3DCanvas(tk.Frame):
                 )
 
             if mesh.lines is not None and len(mesh.lines):
-                line_vertices = np.ascontiguousarray(positions[mesh.lines].reshape((-1, 3)))
+                line_indices = np.arange(len(mesh.lines), dtype=np.uint32)
+                if owner_table is not None and not visibility_state.is_default:
+                    line_indices = np.asarray(
+                        [
+                            index for index in line_indices
+                            if visibility_state.accepts(
+                                owner_table.owners_for("line", int(index), owner_resolver)
+                            )
+                        ],
+                        dtype=np.uint32,
+                    )
+                line_vertices = np.ascontiguousarray(positions[mesh.lines[line_indices]].reshape((-1, 3)))
                 result.append(
                     {
                         "kind": "lines",
                         "vertices": line_vertices,
-                        "total": len(mesh.lines),
+                        "total": len(line_indices),
                         "color": str(obj.get("line_color") or obj.get("outline") or "black"),
                         "width": int(obj.get("line_width") or obj.get("width", 1)),
                         "layer": int(obj.get("line_layer", 30)),
                         "tags": obj.get("tags", ""),
                         "owner_table": owner_table,
-                        "owner_primitives": np.arange(len(mesh.lines), dtype=np.uint32),
+                        "owner_primitives": line_indices,
                         "owner_resolver": owner_resolver,
                     }
                 )
             if mesh.point_indices is not None and len(mesh.point_indices):
-                total = len(mesh.point_indices)
+                point_primitives = np.arange(len(mesh.point_indices), dtype=np.uint32)
+                if owner_table is not None and not visibility_state.is_default:
+                    point_primitives = np.asarray(
+                        [
+                            index for index in point_primitives
+                            if visibility_state.accepts(
+                                owner_table.owners_for("point", int(index), owner_resolver)
+                            )
+                        ],
+                        dtype=np.uint32,
+                    )
+                total = len(point_primitives)
                 result.append(
                     {
                         "kind": "markers",
-                        "points": positions[mesh.point_indices],
+                        "points": positions[mesh.point_indices[point_primitives]],
                         "colors": [str(obj.get("point_color", "#2563eb"))] * total,
                         "outlines": [str(obj.get("point_outline", ""))] * total,
                         "sizes": [int(obj.get("point_size", 6))] * total,
                         "layer": int(obj.get("point_layer", 32)),
                         "tags": obj.get("tags", ""),
                         "owner_table": owner_table,
-                        "owner_primitives": np.arange(total, dtype=np.uint32),
+                        "owner_primitives": point_primitives,
                         "owner_resolver": owner_resolver,
                     }
                 )

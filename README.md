@@ -126,6 +126,12 @@ scene data, apply the state, and only then replace the working widget.
 `Pick`, `ViewerState`, `ViewerBackend`, and the established geometry and
 selection types are exact re-exports of their ANY3dView definitions.
 
+ANYtk3D 0.5.2 also re-exports `SemanticRef`, `VisibilityState`,
+`ViewerCommand`, `ViewerCommandController`, and `viewer_command_manifest`
+with exact class identity. Semantic hide/show/isolate policies filter retained
+faces, lines, points and legacy bound primitives without deleting scene data,
+and hidden primitives are excluded from projection-based selection.
+
 `capture_image()` returns an RGBA Pillow image of the mapped inner canvas when
 Pillow is installed (the integrated GUI application extras install it). The
 base ANYtk3D import remains Pillow-independent; an unmapped or unavailable
