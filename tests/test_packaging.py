@@ -53,7 +53,7 @@ def test_every_public_name_is_importable():
 def test_runtime_dependencies_are_declared(metadata):
     # NumPy remains a direct renderer dependency and ANY3dView supplies the
     # shared core; tkinter ships with CPython and is not a distribution.
-    assert metadata['dependencies'] == ['numpy', 'ANY3dView>=0.5.2,<0.6']
+    assert metadata['dependencies'] == ['numpy', 'ANY3dView>=0.5.3,<0.6']
     sources = ' '.join(
         path.read_text(encoding='utf-8')
         for path in (ROOT / 'src' / 'anytk3d').glob('*.py')
