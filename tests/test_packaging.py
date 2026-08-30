@@ -5,6 +5,7 @@ These run against the working tree, so a version bump or a renamed entry
 point is caught before a distribution is built rather than after it is on
 PyPI.
 '''
+import os
 import pathlib
 import shutil
 import subprocess
@@ -17,8 +18,9 @@ import pytest
 import anytk3d
 
 
-ROOT = pathlib.Path(anytk3d.__file__).resolve().parents[2]
+ROOT = pathlib.Path(__file__).resolve().parents[1]
 PYPROJECT = ROOT / 'pyproject.toml'
+ANY3DVIEW_ROOT_ENV = 'ANYTK3D_ANY3DVIEW_ROOT'
 
 
 @pytest.fixture(scope='module')
@@ -122,9 +124,27 @@ def test_release_candidate_builds_an_importable_wheel_pair(metadata, tmp_path):
         names = set(archive.namelist())
     assert 'anytk3d/_selection.py' in names
 
-    core_root = ROOT.parent / 'ANY3dView'
+    configured_core_root = os.environ.get(ANY3DVIEW_ROOT_ENV)
+    if configured_core_root is None:
+        core_root = (ROOT.parent / 'ANY3dView').resolve()
+    else:
+        configured_core_root = configured_core_root.strip()
+        if not configured_core_root:
+            pytest.fail(f'{ANY3DVIEW_ROOT_ENV} must not be blank when set')
+        core_root = pathlib.Path(configured_core_root).expanduser().resolve()
     if not (core_root / 'pyproject.toml').is_file():
+        if configured_core_root:
+            pytest.fail(
+                f'{ANY3DVIEW_ROOT_ENV} does not identify an ANY3dView checkout: '
+                f'{core_root}'
+            )
         pytest.skip('paired release gate requires the sibling ANY3dView checkout')
+    core_metadata = tomllib.loads(
+        (core_root / 'pyproject.toml').read_text(encoding='utf-8')
+    )['project']
+    assert core_metadata['name'] == 'ANY3dView'
+    if configured_core_root:
+        assert core_metadata['version'] == '0.5.4'
     core_wheel_dir = tmp_path / 'core-wheel'
     core_build = subprocess.run(
         [
@@ -154,9 +174,14 @@ def test_release_candidate_builds_an_importable_wheel_pair(metadata, tmp_path):
                 'import sys; '
                 f'sys.path.insert(0, {str(core_wheels[0])!r}); '
                 f'sys.path.insert(0, {str(wheels[0])!r}); '
-                'import anytk3d; '
+                'import pathlib; import any3dview; import anytk3d; '
                 'from anytk3d._selection import ProjectedSelectionIndex; '
                 f'assert anytk3d.__version__ == {metadata["version"]!r}; '
+                "assert any3dview.__version__ == '0.5.4'; "
+                f'assert pathlib.Path(anytk3d.__file__).resolve().is_relative_to('
+                f'pathlib.Path({str(wheels[0])!r}).resolve()); '
+                f'assert pathlib.Path(any3dview.__file__).resolve().is_relative_to('
+                f'pathlib.Path({str(core_wheels[0])!r}).resolve()); '
                 'assert ProjectedSelectionIndex is not None'
             ),
         ],
