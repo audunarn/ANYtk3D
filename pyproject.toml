@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ANYtk3D"
-version = "0.5.3"
+version = "0.5.5"
 description = "Fast dependency-free 3D drawing on a Tkinter Canvas - solids, meshes, lighting, layered transparency and depth-correct painter rendering without OpenGL or matplotlib"
 readme = "README.md"
-license = "GPL-3.0-or-later"
-license-files = ["LICENSE"]
+license = "MPL-2.0"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
 authors = [
     { name = "Audun Arnesen Nyhus", email = "audunarn@gmail.com" },
 ]
@@ -46,12 +46,12 @@ classifiers = [
 ]
 dependencies = [
     "numpy",
-    "ANY3dView>=0.5.3,<0.6",
+    "ANY3dView>=0.5.5,<0.6",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest", "build", "twine"]
-geometry = ["ANY3dView[geometry]>=0.5.3,<0.6"]
+geometry = ["ANY3dView[geometry]>=0.5.5,<0.6"]
 
 # Tkinter demo: a GUI entry point so no console window opens alongside it.
 [project.gui-scripts]

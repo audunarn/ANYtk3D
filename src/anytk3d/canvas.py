@@ -960,6 +960,7 @@ class Tkinter3DCanvas(tk.Frame):
         width: int = 170,
         value_range: Optional[Tuple[float, float]] = None,
         colors: Optional[Sequence[str]] = None,
+        font_size: int = 10,
     ) -> None:
         clean_values = sorted(
             {float(value) for value in values if math.isfinite(float(value))}
@@ -996,6 +997,7 @@ class Tkinter3DCanvas(tk.Frame):
             "title": str(title),
             "width": max(130, int(width)),
             "colors": legend_colors,
+            "font_size": max(8, min(28, int(font_size))),
         }
         self._invalidate_geometry_cache()
         self._request_redraw()
@@ -1118,10 +1120,15 @@ class Tkinter3DCanvas(tk.Frame):
         )
 
         padding = 14
+        font_size = int(legend.get("font_size", 10))
+        title_font_size = min(30, font_size + 1)
         title = str(legend.get("title", "Plate thickness"))
         unit = str(legend.get("unit", ""))
         title_text = f"{title} [{unit}]" if unit else title
-        max_title_chars = max(12, int((panel_width - 2 * padding) / 7))
+        max_title_chars = max(
+            12,
+            int((panel_width - 2 * padding) / max(5.0, 0.62 * title_font_size)),
+        )
         title_lines = self._legend_text_lines(title_text, max_title_chars)
         title_y = 18
         for line in title_lines:
@@ -1130,11 +1137,11 @@ class Tkinter3DCanvas(tk.Frame):
                 title_y,
                 text=line,
                 anchor="nw",
-                font=("TkDefaultFont", 10, "bold"),
+                font=("TkDefaultFont", title_font_size, "bold"),
                 fill="#202020",
                 tags=_HUD_LEGEND_TAGS,
             )
-            title_y += 15
+            title_y += title_font_size + 5
 
         values = list(legend.get("values", []))
         minimum = float(legend["minimum"])
@@ -1145,7 +1152,10 @@ class Tkinter3DCanvas(tk.Frame):
         # A short set of distinct thicknesses is clearer as labelled swatches.
         if 1 <= len(values) <= 10:
             values = sorted(values, reverse=True)
-            row_height = min(34, max(23, available_height // len(values)))
+            row_height = min(
+                max(34, font_size + 12),
+                max(font_size + 8, available_height // len(values)),
+            )
             swatch_width = 34
             y_coord = bar_top
             for value in values:
@@ -1165,6 +1175,7 @@ class Tkinter3DCanvas(tk.Frame):
                     y_coord + 8,
                     text=self._format_legend_value(value),
                     anchor="w",
+                    font=("TkDefaultFont", font_size),
                     fill="#202020",
                     tags=_HUD_LEGEND_TAGS,
                 )
@@ -1216,6 +1227,7 @@ class Tkinter3DCanvas(tk.Frame):
                 y_coord,
                 text=self._format_legend_value(value),
                 anchor="w",
+                font=("TkDefaultFont", font_size),
                 fill="#202020",
                 tags=_HUD_LEGEND_TAGS,
             )
@@ -1240,6 +1252,7 @@ class Tkinter3DCanvas(tk.Frame):
                 tuple(legend.get("values", ())),
                 tuple(legend.get("colors", ())),
                 legend.get("width"),
+                legend.get("font_size"),
                 self.width,
                 self.height,
                 self.bg,

@@ -3,6 +3,7 @@ The colour scale is shared module state that applications swap when the
 user picks a different colour map, so it needs a real API rather than a
 patchable constant.
 '''
+import inspect
 import tkinter as tk
 
 import pytest
@@ -17,6 +18,26 @@ VIRIDIS = (
     (0.5, '#21918c'),
     (1.0, '#fde725'),
 )
+
+
+def test_legend_api_exposes_configurable_text_size_without_opening_tk():
+    signature = inspect.signature(Tkinter3DCanvas.set_thickness_legend)
+
+    assert signature.parameters["font_size"].default == 10
+
+
+def test_legend_retains_requested_text_size_without_opening_tk():
+    canvas = Tkinter3DCanvas.__new__(Tkinter3DCanvas)
+    canvas._thickness_legend = None
+    canvas._invalidate_geometry_cache = lambda: None
+    canvas._request_redraw = lambda: None
+
+    canvas.set_thickness_legend(
+        (0.0, 1.0), title="Displacement", width=220, font_size=12
+    )
+
+    assert canvas._thickness_legend["width"] == 220
+    assert canvas._thickness_legend["font_size"] == 12
 
 
 @pytest.fixture(autouse=True)

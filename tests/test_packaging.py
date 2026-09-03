@@ -55,7 +55,7 @@ def test_every_public_name_is_importable():
 def test_runtime_dependencies_are_declared(metadata):
     # NumPy remains a direct renderer dependency and ANY3dView supplies the
     # shared core; tkinter ships with CPython and is not a distribution.
-    assert metadata['dependencies'] == ['numpy', 'ANY3dView>=0.5.3,<0.6']
+    assert metadata['dependencies'] == ['numpy', 'ANY3dView>=0.5.5,<0.6']
     sources = ' '.join(
         path.read_text(encoding='utf-8')
         for path in (ROOT / 'src' / 'anytk3d').glob('*.py')
@@ -144,7 +144,7 @@ def test_release_candidate_builds_an_importable_wheel_pair(metadata, tmp_path):
     )['project']
     assert core_metadata['name'] == 'ANY3dView'
     if configured_core_root:
-        assert core_metadata['version'] == '0.5.4'
+        assert core_metadata['version'] == '0.5.5'
     core_wheel_dir = tmp_path / 'core-wheel'
     core_build = subprocess.run(
         [
@@ -177,7 +177,7 @@ def test_release_candidate_builds_an_importable_wheel_pair(metadata, tmp_path):
                 'import pathlib; import any3dview; import anytk3d; '
                 'from anytk3d._selection import ProjectedSelectionIndex; '
                 f'assert anytk3d.__version__ == {metadata["version"]!r}; '
-                "assert any3dview.__version__ == '0.5.4'; "
+                "assert any3dview.__version__ == '0.5.5'; "
                 f'assert pathlib.Path(anytk3d.__file__).resolve().is_relative_to('
                 f'pathlib.Path({str(wheels[0])!r}).resolve()); '
                 f'assert pathlib.Path(any3dview.__file__).resolve().is_relative_to('

@@ -395,4 +395,8 @@ fails to import.
 
 ## License
 
-GPL-3.0-or-later. See [LICENSE](LICENSE).
+Starting with version 0.5.5, ANYtk3D is licensed under the Mozilla Public
+License 2.0. See [LICENSE](LICENSE). Earlier releases remain under the license
+terms that accompanied those releases.
+
+See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for dependency notices.

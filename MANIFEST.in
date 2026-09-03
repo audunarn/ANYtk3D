@@ -2,6 +2,8 @@
 # from the sdist alone.  Wheels are unaffected: they only carry src/anytk3d.
 include LICENSE
 include README.md
+include RELEASE_NOTES.md
+include THIRD_PARTY_NOTICES.md
 include pyproject.toml
 include run_gui.py
 recursive-include tests *.py
