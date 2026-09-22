@@ -9,6 +9,15 @@ ACTION = re.compile(r"uses:\s*([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)@([^\s#]+)")
 COMMIT = re.compile(r"[0-9a-f]{40}")
 
 EXPECTED = {
+    ".github/workflows/compatibility.yml": (
+        ("actions/checkout", "d23441a48e516b6c34aea4fa41551a30e30af803"),
+        ("actions/checkout", "d23441a48e516b6c34aea4fa41551a30e30af803"),
+        ("actions/setup-python", "ece7cb06caefa5fff74198d8649806c4678c61a1"),
+    ) * 3 + (
+        ("actions/checkout", "d23441a48e516b6c34aea4fa41551a30e30af803"),
+    ) * 5 + (
+        ("actions/setup-python", "ece7cb06caefa5fff74198d8649806c4678c61a1"),
+    ),
     ".github/workflows/release.yml": (
         ("actions/checkout", "d23441a48e516b6c34aea4fa41551a30e30af803"),
         ("actions/setup-python", "ece7cb06caefa5fff74198d8649806c4678c61a1"),

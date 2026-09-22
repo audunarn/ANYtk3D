@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import importlib.util
 import math
+from copy import deepcopy
 import sys
 import time
 import tkinter as tk
@@ -822,6 +823,8 @@ class Tkinter3DCanvas(tk.Frame):
             interaction_profile=str(self._interaction_profile),
             semantic_selection=getattr(self, "_semantic_selection", ()),
             visibility=getattr(self, "_visibility_state", VisibilityState()),
+            **({"light": deepcopy(self._light), "selection_config": self._selection_config}
+               if "light" in ViewerState.__dataclass_fields__ else {}),
         )
 
     def apply_view_state(self, state: ViewerState, *, redraw: bool = True) -> None:
@@ -861,6 +864,10 @@ class Tkinter3DCanvas(tk.Frame):
         self._show_axis_indicator = bool(state.axis_indicator)
         self.show_axis_ruler = bool(state.axis_ruler)
         self.set_interaction_profile(interaction_profile)
+        if getattr(state, "light", None) is not None:
+            self._light = deepcopy(state.light)
+        if getattr(state, "selection_config", None) is not None:
+            self._selection_config = state.selection_config
         self._semantic_selection = semantic_refs(state.semantic_selection)
         self._visibility_state = state.visibility
         plane = state.section_plane
@@ -2546,39 +2553,20 @@ class Tkinter3DCanvas(tk.Frame):
         self._request_redraw(interactive=False)
 
     def capture_image(self):
-        """Return the visible drawable area as a top-left-oriented Pillow image.
+        """Render a report image from canvas contents, independent of desktop pixels."""
+        from .capture import render_canvas
 
-        Tk has no dependency-free raster readback.  When Pillow is installed,
-        capture the mapped inner canvas rather than its surrounding frame,
-        toolbars, or window chrome.  Pillow remains a lazy optional import.
-        """
-
+        self.event_widget.update_idletasks()
+        interactive = self._interactive_render
         try:
-            from PIL import ImageGrab
-        except ImportError as error:  # pragma: no cover - optional dependency
-            raise RuntimeError(
-                "capture_image requires Pillow (installed by the GUI application extras)"
-            ) from error
-
-        widget = self.event_widget
-        try:
-            widget.update_idletasks()
-            x0 = int(widget.winfo_rootx())
-            y0 = int(widget.winfo_rooty())
-            width = int(widget.winfo_width())
-            height = int(widget.winfo_height())
-        except (AttributeError, TypeError, ValueError, tk.TclError) as error:
-            raise RuntimeError("the software viewport is not available for capture") from error
-        if width <= 1 or height <= 1:
-            raise RuntimeError("the software viewport must be visible before capture")
-        try:
-            return ImageGrab.grab(
-                bbox=(x0, y0, x0 + width, y0 + height)
-            ).convert("RGBA")
-        except (OSError, RuntimeError, ValueError) as error:
-            raise RuntimeError(
-                "the operating system could not capture the visible software viewport"
-            ) from error
+            self._interactive_render = False
+            self.redraw()
+            return render_canvas(
+                self.event_widget, background=self.bg,
+                exclude=(getattr(self, "_selection_overlay", None),),
+            )
+        finally:
+            self._interactive_render = interactive
 
     def _animation_tick(self) -> None:
         if not self._is_playing_animation or not self._animation_cache:

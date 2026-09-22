@@ -50,7 +50,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "build", "twine"]
+dev = ["pytest", "build", "twine", "setuptools>=77", "wheel", "tomli; python_version < '3.11'"]
+capture = ["Pillow>=10,<13"]
 geometry = ["ANY3dView[geometry]>=0.5.5,<0.6"]
 
 # Tkinter demo: a GUI entry point so no console window opens alongside it.
