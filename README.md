@@ -1,5 +1,19 @@
 # ANYtk3D
 
+Image export uses the canvas display list instead of desktop screenshots.
+`viewer.capture_image()` returns a Pillow RGBA image including the scene and
+HUD, with supersampled edges, text, markers, arrows and stippled transparency.
+The viewport must have received an initial layout; it can then be covered or
+hidden without contaminating the exported image. Fonts use available system
+faces with a Pillow fallback, so rasterization need not match Tk pixel for pixel.
+Install the optional support with `pip install "ANYtk3D[capture]"`.
+
+Lighting and selection configuration are preserved by the shared view-state
+contract when switching between the current GPU and software viewers.
+The `Viewer compatibility` workflow exercises paired source and wheel installs,
+supported core Python/OS versions, geometry extras, Linux desktop rendering,
+and ANYfem/ANYstructure viewport contracts.
+
 Fast NumPy-backed 3D drawing on a Tkinter Canvas.
 
 ANYtk3D is the standalone 3D viewport extracted from

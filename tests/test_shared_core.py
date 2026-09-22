@@ -287,23 +287,77 @@ def test_software_capabilities_describe_legacy_and_interaction_features():
     assert capabilities.image_capture is (importlib.util.find_spec("PIL") is not None)
 
 
-def test_software_capture_uses_only_the_inner_event_widget(monkeypatch):
+def test_software_capture_uses_canvas_contents_and_restores_interaction(monkeypatch):
     image_module = pytest.importorskip("PIL.Image")
-    image_grab = pytest.importorskip("PIL.ImageGrab")
-    captured = []
-
-    def grab(*, bbox):
-        captured.append(bbox)
-        return image_module.new("RGB", (bbox[2] - bbox[0], bbox[3] - bbox[1]))
-
-    monkeypatch.setattr(image_grab, "grab", grab)
+    from anytk3d import capture
     canvas = contract_canvas()
-
+    canvas._interactive_render = True
+    drawn = []
+    canvas.redraw = lambda: drawn.append(canvas._interactive_render)
+    seen = []
+    def render(widget, **options):
+        seen.append((widget, options))
+        return image_module.new("RGBA", (200, 100))
+    monkeypatch.setattr(capture, "render_canvas", render)
     image = canvas.capture_image()
+    assert seen[0][0] is canvas.event_widget
+    assert seen[0][1]["background"] == "white"
+    assert drawn == [False]
+    assert canvas._interactive_render
+    assert image.mode == "RGBA" and image.size == (200, 100)
 
-    assert captured == [(11, 17, 211, 117)]
-    assert image.mode == "RGBA"
-    assert image.size == (200, 100)
+
+def test_view_state_preserves_light_and_selection_without_aliasing():
+    canvas = contract_canvas()
+    canvas._light = any3dview.Light(ambient=.2, diffuse=.6, follow_camera=True)
+    canvas._selection_config = any3dview.SelectionConfig(tool="lasso", click_radius_px=9)
+    state = canvas.export_view_state()
+    target = contract_canvas()
+    target.apply_view_state(state, redraw=False)
+    assert target.light.key() == canvas.light.key()
+    assert target.selection_config == canvas.selection_config
+    canvas.light.ambient = .9
+    assert state.light.ambient == .2
+    target.light.ambient = .7
+    assert state.light.ambient == .2
+
+
+def test_lighting_and_selection_survive_both_backend_directions():
+    pytest.importorskip("moderngl")
+    from any3dview.gpu import Any3DView
+    source = contract_canvas()
+    source._light = any3dview.Light(ambient=.15, specular=.3, follow_camera=True)
+    source._selection_config = any3dview.SelectionConfig(tool="lasso", depth="through")
+    gpu = contract_canvas()
+    gpu._renderer = SimpleNamespace(pick_dirty=False)
+    state = source.export_view_state()
+    Any3DView.apply_view_state(gpu, state, redraw=False)
+    returned = Any3DView.export_view_state(gpu)
+    target = contract_canvas()
+    target.apply_view_state(returned, redraw=False)
+    assert target.light.key() == source.light.key()
+    assert target.selection_config == source.selection_config
+    assert target.light is not source.light
+    target.light.ambient = .7
+    assert state.light.ambient == .15
+
+
+def test_software_keeps_compatibility_with_older_core_state_shape(monkeypatch):
+    from dataclasses import fields, field, make_dataclass
+    from anytk3d import canvas as canvas_module
+    legacy = make_dataclass("LegacyViewerState", [
+        (item.name, item.type, field(default=item.default))
+        for item in fields(any3dview.ViewerState)
+        if item.name not in {"light", "selection_config"}
+    ], frozen=True)
+    monkeypatch.setattr(canvas_module, "ViewerState", legacy)
+    source = contract_canvas()
+    state = source.export_view_state()
+    assert not hasattr(state, "light")
+    target = contract_canvas()
+    target._light.ambient = .25
+    target.apply_view_state(state, redraw=False)
+    assert target.light.ambient == .25
 
 
 def test_retained_application_selection_is_compiled_as_a_face_mask():
